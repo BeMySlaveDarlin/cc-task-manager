@@ -1,0 +1,11 @@
+{
+  "name": "cc-task-manager",
+  "description": "Task lifecycle management for Claude Code projects. Create, track, close tasks. Session finalization and resume.",
+  "version": "1.0.0",
+  "author": {
+    "name": "BeMySlaveDarlin",
+    "url": "https://github.com/BeMySlaveDarlin"
+  },
+  "license": "MIT",
+  "keywords": ["tasks", "session", "finalize", "resume", "project-management"]
+}
