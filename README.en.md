@@ -32,16 +32,16 @@ Skills activate automatically based on keywords in your message.
 
 **Examples:**
 
-- `create task: auth refactoring` — task-manager creates a task
-- `show tasks` — task-manager lists tasks
+- `create task: auth refactoring` — ts creates a task
+- `show tasks` — ts lists tasks
 - `finalize` — finalize updates the registry
-- `let's continue` — resume shows context
+- `let's continue` — rs shows context
 
 **Explicit commands:**
 
-- `/task` — task management
+- `/ts` — task management
 - `/finalize` (alias `/fin`) — session finalization
-- `/resume` — context restore
+- `/rs` — context restore
 
 ## Storage
 
@@ -57,11 +57,11 @@ Tasks are stored in `.claude/session/` of the target project:
 
 ## Skills
 
-| Skill | Triggers | What it does |
-|-------|----------|--------------|
-| task-manager | create task, show tasks, close task... | Task CRUD |
-| finalize | finalize, wrap up, summarize session... | Session finalization |
-| resume | let's continue, where we left off, resume... | Context restore |
+| Skill          | Triggers                                     | What it does         |
+|----------------|----------------------------------------------|----------------------|
+| ts             | create task, show tasks, close task...       | Task CRUD            |
+| finalize / fin | finalize, wrap up, summarize session...      | Session finalization |
+| rs             | let's continue, where we left off, resume... | Context restore      |
 
 ## License
 
