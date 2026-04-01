@@ -9,7 +9,7 @@
     {
       "name": "cc-task-manager",
       "description": "Task lifecycle management for Claude Code projects.",
-      "version": "1.0.0",
+      "version": "1.1.1",
       "source": "./",
       "repository": "https://github.com/BeMySlaveDarlin/cc-task-manager",
       "license": "MIT",
