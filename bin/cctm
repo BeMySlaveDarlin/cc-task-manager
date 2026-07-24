@@ -1,0 +1,1399 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import contextlib
+import io
+import json
+import os
+import re
+import shutil
+import sys
+from datetime import date
+from pathlib import Path
+
+SCHEMA_VERSION = 2
+PRIORITIES = ("HIGH", "MEDIUM", "LOW")
+STATUSES = ("open", "deferred", "done", "cancelled")
+TERMINAL = ("done", "cancelled")
+PRIORITY_RANK = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+ACTIVE = ("open", "deferred")
+
+TEXT_FIELDS = ("description", "context", "precondition", "verify", "result")
+LIST_FIELDS = ("plan", "files")
+
+SECTION_MAP = {
+    "описание": "description",
+    "проблема": "description",
+    "description": "description",
+    "problem": "description",
+    "контекст": "context",
+    "context": "context",
+    "план": "plan",
+    "plan": "plan",
+    "предусловие": "precondition",
+    "prerequisite": "precondition",
+    "как проверить": "verify",
+    "проверка": "verify",
+    "verify": "verify",
+    "что сделано": "result",
+    "результат": "result",
+    "result": "result",
+    "ключевые файлы": "files",
+    "файлы": "files",
+    "files": "files",
+}
+
+SECTION_TITLES = (
+    ("description", "Описание"),
+    ("context", "Контекст"),
+    ("plan", "План"),
+    ("precondition", "Предусловие"),
+    ("verify", "Как проверить"),
+    ("result", "Что сделано"),
+    ("files", "Ключевые файлы"),
+)
+
+
+class CctmError(Exception):
+    pass
+
+
+def today() -> str:
+    return date.today().isoformat()
+
+
+def empty_body() -> dict:
+    body = {f: "" for f in TEXT_FIELDS}
+    body.update({f: [] for f in LIST_FIELDS})
+    body["notes"] = {}
+    return body
+
+
+def find_root(start: str | None = None) -> Path:
+    cur = Path(start or os.getcwd()).resolve()
+    for d in [cur, *cur.parents]:
+        if (d / ".claude" / "session").is_dir():
+            return d / ".claude" / "session"
+        if (d / ".git").exists():
+            return d / ".claude" / "session"
+    return cur / ".claude" / "session"
+
+
+class Store:
+    def __init__(self, root: Path):
+        self.root = Path(root)
+
+    @property
+    def tasks_dir(self) -> Path:
+        return self.root / "tasks"
+
+    @property
+    def meta_path(self) -> Path:
+        return self.root / "meta.json"
+
+    @property
+    def lock_path(self) -> Path:
+        return self.root / ".lock"
+
+    def exists(self) -> bool:
+        return self.meta_path.is_file() or self.tasks_dir.is_dir()
+
+    def legacy_count(self) -> int:
+        details = self.root / "details"
+        files = len(list(details.rglob("*.md"))) if details.is_dir() else 0
+        return files + (1 if (self.root / "tasks.md").is_file() else 0)
+
+    def init(self) -> None:
+        self.tasks_dir.mkdir(parents=True, exist_ok=True)
+        if not self.meta_path.is_file():
+            write_json(self.meta_path, {"version": SCHEMA_VERSION, "next_id": 1, "updated": today()})
+
+    def meta(self) -> dict:
+        if not self.meta_path.is_file():
+            return {"version": SCHEMA_VERSION, "next_id": 1, "updated": today()}
+        return read_json(self.meta_path)
+
+    def save_meta(self, meta: dict) -> None:
+        meta["updated"] = today()
+        write_json(self.meta_path, meta)
+
+    def path_of(self, tid: int) -> Path:
+        return self.tasks_dir / f"{tid:03d}.json"
+
+    def read(self, tid: int) -> dict | None:
+        path = self.path_of(tid)
+        if not path.is_file():
+            for candidate in self.tasks_dir.glob("*.json"):
+                if candidate.stem.lstrip("0") == str(tid):
+                    return read_json(candidate)
+            return None
+        return read_json(path)
+
+    def write(self, task: dict) -> None:
+        self.tasks_dir.mkdir(parents=True, exist_ok=True)
+        task["updated"] = today()
+        write_json(self.path_of(task["id"]), task)
+
+    def remove(self, tid: int) -> None:
+        self.path_of(tid).unlink(missing_ok=True)
+
+    def all(self) -> list[dict]:
+        if not self.tasks_dir.is_dir():
+            return []
+        tasks = []
+        for path in sorted(self.tasks_dir.glob("*.json")):
+            try:
+                tasks.append(read_json(path))
+            except json.JSONDecodeError as exc:
+                raise CctmError(f"битый файл {path}: {exc}") from exc
+        return sorted(tasks, key=lambda t: t.get("id", 0))
+
+    def take_id(self) -> int:
+        meta = self.meta()
+        tid = int(meta.get("next_id", 1))
+        used = {t.get("id") for t in self.all()}
+        while tid in used:
+            tid += 1
+        meta["next_id"] = tid + 1
+        self.save_meta(meta)
+        return tid
+
+
+def read_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def locked(store: Store):
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    store.root.mkdir(parents=True, exist_ok=True)
+    with open(store.lock_path, "w", encoding="utf-8") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def parse_md(text: str) -> dict:
+    body = empty_body()
+    current = None
+    buf: list[str] = []
+
+    def flush():
+        if current is None:
+            return
+        chunk = "\n".join(buf).strip()
+        field = SECTION_MAP.get(current.strip().lower())
+        if field in LIST_FIELDS:
+            body[field] = extract_items(chunk)
+        elif field:
+            body[field] = chunk
+        elif chunk:
+            body["notes"][current.strip()] = chunk
+
+    for line in text.splitlines():
+        heading = re.match(r"^#{2,}\s+(.+?)\s*$", line)
+        if heading:
+            flush()
+            current = heading.group(1)
+            buf = []
+            continue
+        if re.match(r"^#\s+", line) and current is None:
+            continue
+        buf.append(line)
+    flush()
+    return body
+
+
+def extract_items(chunk: str) -> list[str]:
+    items = []
+    for line in chunk.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        bullet = re.match(r"^(?:[-*+]|\d+[.)])\s+(.*)$", stripped)
+        if bullet:
+            items.append(bullet.group(1).strip())
+        elif items:
+            items[-1] += " " + stripped
+        else:
+            items.append(stripped)
+    return items
+
+
+def render_md(task: dict, with_title: bool = True) -> str:
+    body = task.get("body") or {}
+    parts = []
+    if with_title:
+        parts.append(f"# {task.get('title', '')}\n")
+    for field, heading in SECTION_TITLES:
+        value = body.get(field)
+        if not value:
+            continue
+        parts.append(f"## {heading}")
+        if field in LIST_FIELDS:
+            parts.extend(f"- {item}" for item in value)
+        else:
+            parts.append(str(value))
+        parts.append("")
+    for heading, value in (body.get("notes") or {}).items():
+        parts.append(f"## {heading}")
+        parts.append(str(value))
+        parts.append("")
+    return "\n".join(parts).rstrip() + "\n"
+
+
+def merge_body(current: dict, incoming: dict, replace: bool = False) -> dict:
+    if replace:
+        merged = empty_body()
+    else:
+        merged = empty_body()
+        merged.update(current or {})
+    for field in TEXT_FIELDS:
+        if incoming.get(field):
+            merged[field] = incoming[field]
+    for field in LIST_FIELDS:
+        if incoming.get(field):
+            merged[field] = incoming[field]
+    notes = dict(merged.get("notes") or {})
+    notes.update(incoming.get("notes") or {})
+    merged["notes"] = notes
+    return merged
+
+
+def read_source(value: str) -> str:
+    if value == "-":
+        return sys.stdin.read()
+    path = Path(value)
+    if not path.is_file():
+        raise CctmError(f"файл не найден: {value}")
+    return path.read_text(encoding="utf-8")
+
+
+def parse_ids(value: str | None) -> list[int]:
+    if not value:
+        return []
+    ids = []
+    for chunk in re.split(r"[,\s]+", value.strip()):
+        if not chunk:
+            continue
+        if not chunk.lstrip("#").isdigit():
+            raise CctmError(f"не число: {chunk}")
+        ids.append(int(chunk.lstrip("#")))
+    return ids
+
+
+def parse_tags(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [t.strip() for t in value.split(",") if t.strip()]
+
+
+def sort_key(task: dict):
+    order = task.get("order")
+    return (
+        PRIORITY_RANK.get(task.get("priority", "MEDIUM"), 1),
+        order if isinstance(order, int) else 10**6,
+        task.get("id", 0),
+    )
+
+
+def require(store: Store, tid: int) -> dict:
+    task = store.read(tid)
+    if task is None:
+        raise CctmError(f"задача #{tid} не найдена")
+    return task
+
+
+def blockers_of(task: dict, by_id: dict[int, dict]) -> list[int]:
+    return [b for b in task.get("blockedBy") or [] if by_id.get(b, {}).get("status") != "done"]
+
+
+def format_row(task: dict, by_id: dict[int, dict]) -> str:
+    tags = ",".join(task.get("tags") or [])
+    blocked = blockers_of(task, by_id)
+    title = task.get("title", "")
+    if len(title) > 58:
+        title = title[:57] + "…"
+    row = f"#{task['id']:<4} {task.get('priority', 'MEDIUM'):<7} {task.get('status', 'open'):<9} {title:<58}"
+    if tags:
+        row += f"  [{tags}]"
+    if blocked:
+        row += "  блокер: " + ", ".join(f"#{b}" for b in blocked)
+    return row.rstrip()
+
+
+def print_tasks(tasks: list[dict], by_id: dict[int, dict], empty: str) -> None:
+    if not tasks:
+        print(empty)
+        return
+    for task in tasks:
+        print(format_row(task, by_id))
+
+
+def cmd_init(args, store: Store) -> int:
+    with locked(store):
+        store.init()
+    print(f"стор готов: {store.root}")
+    return 0
+
+
+def cmd_create(args, store: Store) -> int:
+    if args.priority and args.priority not in PRIORITIES:
+        raise CctmError(f"приоритет: {', '.join(PRIORITIES)}")
+    if args.status not in STATUSES:
+        raise CctmError(f"статус: {', '.join(STATUSES)}")
+    body = empty_body()
+    if args.md:
+        body = merge_body(body, parse_md(read_source(args.md)))
+    with locked(store):
+        store.init()
+        known = {t["id"] for t in store.all()}
+        blocked = parse_ids(args.blocked_by)
+        missing = [b for b in blocked if b not in known]
+        if missing:
+            raise CctmError("нет таких задач: " + ", ".join(f"#{m}" for m in missing))
+        tid = store.take_id()
+        task = {
+            "id": tid,
+            "title": args.title.strip(),
+            "status": args.status,
+            "priority": args.priority or "MEDIUM",
+            "order": args.order,
+            "created": today(),
+            "updated": today(),
+            "closed": None,
+            "blockedBy": blocked,
+            "tags": parse_tags(args.tags),
+            "external": None,
+            "body": body,
+        }
+        store.write(task)
+    print(f"#{tid} создана: {task['title']}")
+    if not args.md:
+        print(f"тело: cctm set {tid} --md <file>")
+    return 0
+
+
+def cmd_set(args, store: Store) -> int:
+    with locked(store):
+        task = require(store, args.id)
+        if args.md:
+            incoming = parse_md(read_source(args.md))
+        elif args.json:
+            incoming = json.loads(read_source(args.json))
+            if not isinstance(incoming, dict):
+                raise CctmError("ожидался JSON-объект с полями body")
+        else:
+            raise CctmError("нужен --md или --json")
+        task["body"] = merge_body(task.get("body") or {}, incoming, replace=args.replace)
+        store.write(task)
+    print(f"#{args.id} тело обновлено")
+    return 0
+
+
+def cmd_update(args, store: Store) -> int:
+    with locked(store):
+        task = require(store, args.id)
+        tasks = {t["id"]: t for t in store.all()}
+        if args.title:
+            task["title"] = args.title.strip()
+        if args.priority:
+            if args.priority not in PRIORITIES:
+                raise CctmError(f"приоритет: {', '.join(PRIORITIES)}")
+            task["priority"] = args.priority
+        if args.status:
+            if args.status not in STATUSES:
+                raise CctmError(f"статус: {', '.join(STATUSES)}")
+            task["status"] = args.status
+            task["closed"] = today() if args.status in TERMINAL else None
+        if args.tags is not None:
+            task["tags"] = parse_tags(args.tags)
+        if args.add_tag:
+            tags = list(task.get("tags") or [])
+            for tag in parse_tags(args.add_tag):
+                if tag not in tags:
+                    tags.append(tag)
+            task["tags"] = tags
+        if args.blocked_by is not None:
+            blocked = parse_ids(args.blocked_by)
+            missing = [b for b in blocked if b not in tasks]
+            if missing:
+                raise CctmError("нет таких задач: " + ", ".join(f"#{m}" for m in missing))
+            if args.id in blocked:
+                raise CctmError("задача не может блокировать саму себя")
+            task["blockedBy"] = blocked
+        if args.order is not None:
+            task["order"] = args.order
+        store.write(task)
+    print(f"#{args.id} обновлена")
+    return 0
+
+
+def cmd_close(args, store: Store) -> int:
+    with locked(store):
+        task = require(store, args.id)
+        if args.md:
+            task["body"] = merge_body(task.get("body") or {}, parse_md(read_source(args.md)))
+        task["status"] = "done"
+        task["closed"] = today()
+        store.write(task)
+    print(f"#{args.id} закрыта: {task['title']}")
+    return 0
+
+
+def cmd_reopen(args, store: Store) -> int:
+    with locked(store):
+        task = require(store, args.id)
+        task["status"] = "open"
+        task["closed"] = None
+        store.write(task)
+    print(f"#{args.id} открыта заново: {task['title']}")
+    return 0
+
+
+def cmd_delete(args, store: Store) -> int:
+    with locked(store):
+        task = require(store, args.id)
+        if not args.force:
+            raise CctmError(f"удаление #{args.id} требует --force")
+        store.remove(args.id)
+        for other in store.all():
+            blocked = other.get("blockedBy") or []
+            if args.id in blocked:
+                other["blockedBy"] = [b for b in blocked if b != args.id]
+                store.write(other)
+    print(f"#{args.id} удалена: {task['title']}")
+    return 0
+
+
+def select(tasks: list[dict], status: str, priority: str | None, tag: str | None) -> list[dict]:
+    if status == "active":
+        result = [t for t in tasks if t.get("status") in ACTIVE]
+    elif status == "all":
+        result = list(tasks)
+    else:
+        result = [t for t in tasks if t.get("status") == status]
+    if priority:
+        result = [t for t in result if t.get("priority") == priority]
+    if tag:
+        result = [t for t in result if tag in (t.get("tags") or [])]
+    return sorted(result, key=sort_key)
+
+
+def cmd_list(args, store: Store) -> int:
+    tasks = store.all()
+    by_id = {t["id"]: t for t in tasks}
+    selected = select(tasks, args.status, args.priority, args.tag)
+    if args.json:
+        json.dump(selected, sys.stdout, ensure_ascii=False, indent=2)
+        print()
+        return 0
+    print_tasks(selected, by_id, "задач нет")
+    if args.status == "active":
+        done = len([t for t in tasks if t.get("status") == "done"])
+        if done:
+            print(f"\nвыполнено: {done} (cctm list --status done)")
+    return 0
+
+
+def cmd_next(args, store: Store) -> int:
+    tasks = store.all()
+    by_id = {t["id"]: t for t in tasks}
+    ready = [t for t in tasks if t.get("status") == "open" and not blockers_of(t, by_id)]
+    blocked = [t for t in tasks if t.get("status") == "open" and blockers_of(t, by_id)]
+    ready = sorted(ready, key=sort_key)[: args.limit]
+    if args.json:
+        json.dump(
+            {"ready": ready, "blocked": sorted(blocked, key=sort_key), "deferred": [t for t in tasks if t.get("status") == "deferred"]},
+            sys.stdout,
+            ensure_ascii=False,
+            indent=2,
+        )
+        print()
+        return 0
+    print_tasks(ready, by_id, "открытых задач нет")
+    if blocked:
+        print("\nзаблокированы:")
+        print_tasks(sorted(blocked, key=sort_key), by_id, "")
+    return 0
+
+
+def cmd_show(args, store: Store) -> int:
+    task = require(store, args.id)
+    if args.json:
+        json.dump(task, sys.stdout, ensure_ascii=False, indent=2)
+        print()
+        return 0
+    if args.md:
+        sys.stdout.write(render_md(task))
+        return 0
+    head = f"#{task['id']} {task['title']}"
+    meta = f"{task.get('status')} · {task.get('priority')} · создана {task.get('created')}"
+    if task.get("closed"):
+        meta += f" · закрыта {task['closed']}"
+    if task.get("tags"):
+        meta += " · " + ",".join(task["tags"])
+    if task.get("blockedBy"):
+        meta += " · блокеры: " + ", ".join(f"#{b}" for b in task["blockedBy"])
+    if task.get("external"):
+        meta += f" · натив: {task['external'].get('session')}/{task['external'].get('id')}"
+    print(head)
+    print(meta)
+    print()
+    sys.stdout.write(render_md(task, with_title=False))
+    return 0
+
+
+def cmd_grep(args, store: Store) -> int:
+    pattern = re.compile(args.pattern, re.IGNORECASE)
+    hits = []
+    for task in store.all():
+        haystack = [("title", task.get("title", ""))]
+        body = task.get("body") or {}
+        for field in TEXT_FIELDS:
+            haystack.append((field, str(body.get(field) or "")))
+        for field in LIST_FIELDS:
+            haystack.extend((field, str(item)) for item in body.get(field) or [])
+        for heading, value in (body.get("notes") or {}).items():
+            haystack.append((heading, str(value)))
+        matches = [(field, value) for field, value in haystack if value and pattern.search(value)]
+        if matches:
+            hits.append({"task": task, "matches": matches})
+    if args.json:
+        json.dump(
+            [{"id": h["task"]["id"], "title": h["task"]["title"], "matches": [{"field": f, "text": v} for f, v in h["matches"]]} for h in hits],
+            sys.stdout,
+            ensure_ascii=False,
+            indent=2,
+        )
+        print()
+        return 0
+    if not hits:
+        print("совпадений нет")
+        return 1
+    for hit in hits:
+        task = hit["task"]
+        print(f"#{task['id']} {task.get('status')} {task['title']}")
+        for field, value in hit["matches"][: args.context]:
+            snippet = " ".join(value.split())
+            if len(snippet) > 100:
+                match = pattern.search(snippet)
+                start = max(0, match.start() - 40)
+                snippet = ("…" if start else "") + snippet[start : start + 100] + "…"
+            print(f"    {field}: {snippet}")
+    return 0
+
+
+def cmd_export(args, store: Store) -> int:
+    tasks = store.all()
+    by_id = {t["id"]: t for t in tasks}
+    lines = [f"# Задачи проекта\n", f"Обновлено: {today()}\n"]
+    for status, heading in (("open", "Открытые"), ("deferred", "Отложенные"), ("done", "Выполненные"), ("cancelled", "Отменённые")):
+        group = sorted([t for t in tasks if t.get("status") == status], key=sort_key)
+        if not group:
+            continue
+        lines.append(f"## {heading}\n")
+        for task in group:
+            lines.append(f"### {format_row(task, by_id)}\n")
+            lines.append(render_md(task, with_title=False))
+            lines.append("")
+    text = "\n".join(lines).rstrip() + "\n"
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+        print(f"экспорт: {args.out}")
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+def cmd_doctor(args, store: Store) -> int:
+    problems = []
+    fixed = []
+    if not store.exists():
+        print("стор не инициализирован")
+        return 0
+    tasks = []
+    for path in sorted(store.tasks_dir.glob("*.json")):
+        try:
+            task = read_json(path)
+        except json.JSONDecodeError as exc:
+            problems.append(f"{path.name}: не парсится ({exc})")
+            continue
+        if not isinstance(task.get("id"), int):
+            problems.append(f"{path.name}: нет числового id")
+            continue
+        if path.stem != f"{task['id']:03d}":
+            target = store.path_of(task["id"])
+            if args.fix and not target.exists():
+                os.replace(path, target)
+                fixed.append(f"{path.name} → {target.name}")
+            else:
+                problems.append(f"{path.name}: имя файла не совпадает с id {task['id']}")
+                continue
+        tasks.append(task)
+
+    seen: dict[int, str] = {}
+    for task in tasks:
+        tid = task["id"]
+        if tid in seen:
+            problems.append(f"#{tid}: дубль id")
+        seen[tid] = task.get("title", "")
+        if task.get("status") not in STATUSES:
+            problems.append(f"#{tid}: статус {task.get('status')!r}")
+        if task.get("priority") not in PRIORITIES:
+            problems.append(f"#{tid}: приоритет {task.get('priority')!r}")
+        closed_ok = bool(task.get("closed")) == (task.get("status") in TERMINAL)
+        if not closed_ok:
+            if args.fix:
+                task["closed"] = today() if task.get("status") in TERMINAL else None
+                store.write(task)
+                fixed.append(f"#{tid}: closed приведён к статусу")
+            else:
+                problems.append(f"#{tid}: closed не соответствует статусу")
+        for field in ("created", "closed"):
+            value = task.get(field)
+            if value and not re.match(r"^\d{4}-\d{2}-\d{2}$", str(value)):
+                problems.append(f"#{tid}: {field}={value!r} не дата")
+
+    ids = set(seen)
+    for task in tasks:
+        for blocker in task.get("blockedBy") or []:
+            if blocker not in ids:
+                problems.append(f"#{task['id']}: блокер #{blocker} не существует")
+            if blocker == task["id"]:
+                problems.append(f"#{task['id']}: блокирует сам себя")
+    cycle = find_cycle({t["id"]: [b for b in t.get("blockedBy") or [] if b in ids] for t in tasks})
+    if cycle:
+        problems.append("цикл блокировок: " + " → ".join(f"#{c}" for c in cycle))
+
+    meta = store.meta()
+    max_id = max(ids) if ids else 0
+    if int(meta.get("next_id", 1)) <= max_id:
+        if args.fix:
+            meta["next_id"] = max_id + 1
+            store.save_meta(meta)
+            fixed.append(f"meta.next_id → {max_id + 1}")
+        else:
+            problems.append(f"meta.next_id={meta.get('next_id')} не больше max id {max_id}")
+    if int(meta.get("version", 0)) != SCHEMA_VERSION:
+        problems.append(f"версия схемы {meta.get('version')}, ожидается {SCHEMA_VERSION}")
+
+    for note in fixed:
+        print(f"починено: {note}")
+    if not problems:
+        print(f"инвариантов нарушено нет · задач: {len(tasks)}")
+        return 0
+    for note in problems:
+        print(f"проблема: {note}")
+    return 1
+
+
+def find_cycle(graph: dict[int, list[int]]) -> list[int]:
+    state: dict[int, int] = {}
+    stack: list[int] = []
+
+    def walk(node: int) -> list[int]:
+        state[node] = 1
+        stack.append(node)
+        for nxt in graph.get(node, []):
+            if state.get(nxt) == 1:
+                return stack[stack.index(nxt) :] + [nxt]
+            if state.get(nxt, 0) == 0:
+                found = walk(nxt)
+                if found:
+                    return found
+        stack.pop()
+        state[node] = 2
+        return []
+
+    for node in graph:
+        if state.get(node, 0) == 0:
+            found = walk(node)
+            if found:
+                return found
+    return []
+
+
+# ---------------------------------------------------------------- sync
+
+def claude_home() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+
+
+def project_slug(path: Path) -> str:
+    return str(path).replace("/", "-").replace(".", "-").replace("_", "-")
+
+
+def native_dirs(project_root: Path) -> list[Path]:
+    home = claude_home()
+    proj = home / "projects" / project_slug(project_root)
+    dirs: list[Path] = []
+    seen: set[Path] = set()
+    for transcript in proj.glob("*.jsonl"):
+        uuid = transcript.stem
+        for cand in (home / "tasks" / f"session-{uuid[:8]}", home / "tasks" / uuid):
+            if cand.is_dir() and cand not in seen:
+                seen.add(cand)
+                dirs.append(cand)
+    return dirs
+
+
+def dir_mtime(path: Path) -> float:
+    times = [path.stat().st_mtime]
+    times.extend(f.stat().st_mtime for f in path.glob("*.json"))
+    return max(times)
+
+
+def read_native(path: Path) -> list[dict]:
+    tasks = []
+    for f in sorted(path.glob("*.json")):
+        try:
+            data = read_json(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if isinstance(data, dict) and data.get("subject"):
+            tasks.append(data)
+    return tasks
+
+
+def normalize_title(title: str) -> str:
+    return re.sub(r"[^\wа-яё]+", " ", title.lower()).strip()
+
+
+def titles_match(a: str, b: str) -> bool:
+    from difflib import SequenceMatcher
+    na, nb = normalize_title(a), normalize_title(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    return SequenceMatcher(None, na, nb).ratio() >= 0.85
+
+
+def cmd_sync(args, store: Store) -> int:
+    quiet = args.quiet
+    if args.from_hook:
+        with contextlib.suppress(Exception):
+            payload = json.load(sys.stdin)
+            if isinstance(payload, dict) and payload.get("cwd"):
+                store = Store(find_root(payload["cwd"]))
+    if not store.exists():
+        if not quiet:
+            print(f"стор не найден: {store.root} — синк пропущен")
+        return 0
+
+    project_root = store.root.parent.parent
+    session_env = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    meta = store.meta()
+    last_sync = float(meta.get("last_sync_ts") or 0)
+
+    candidates = native_dirs(project_root)
+    if args.session:
+        wanted = args.session if args.session.startswith("session-") else f"session-{args.session[:8]}"
+        candidates = [d for d in (claude_home() / "tasks" / wanted, claude_home() / "tasks" / args.session) if d.is_dir()]
+    elif not args.all:
+        current = f"session-{session_env[:8]}" if session_env else None
+        cutoff = last_sync or (__import__("time").time() - 7 * 86400)
+        candidates = [d for d in candidates if d.name == current or dir_mtime(d) > cutoff]
+
+    if not candidates:
+        if not quiet:
+            print(f"нативный стор: подходящих сессий нет (искал в {claude_home() / 'tasks'} по {claude_home() / 'projects' / project_slug(project_root)})")
+        return 0
+
+    tasks = store.all()
+    by_external: dict[tuple[str, str], dict] = {}
+    for task in tasks:
+        ext = task.get("external") or {}
+        if ext.get("session") and ext.get("id"):
+            by_external[(ext["session"], str(ext["id"]))] = task
+
+    closed, created, linked, conflicts = [], [], [], []
+    for ndir in candidates:
+        for native in read_native(ndir):
+            key = (ndir.name, str(native["id"]))
+            native_done = native.get("status") in ("completed", "done", "cancelled")
+            task = by_external.get(key)
+            if task is None:
+                match = next((t for t in tasks if titles_match(t.get("title", ""), native["subject"])), None)
+                if match is not None:
+                    task = match
+                    if not (match.get("external") or {}).get("session"):
+                        task["external"] = {"session": ndir.name, "id": str(native["id"])}
+                        linked.append(task)
+            if task is None:
+                body = empty_body()
+                body["description"] = native.get("description") or ""
+                new = {
+                    "id": None,
+                    "title": native["subject"],
+                    "status": "done" if native_done else "open",
+                    "priority": "MEDIUM",
+                    "order": None,
+                    "created": today(),
+                    "updated": today(),
+                    "closed": today() if native_done else None,
+                    "blockedBy": [],
+                    "tags": [],
+                    "external": {"session": ndir.name, "id": str(native["id"])},
+                    "body": body,
+                }
+                created.append(new)
+                tasks.append(new)
+                by_external[key] = new
+                continue
+            if native_done and task.get("status") in ACTIVE:
+                task["status"] = "done"
+                task["closed"] = today()
+                closed.append(task)
+            elif not native_done and task.get("status") in TERMINAL:
+                conflicts.append(task)
+
+    if not (closed or created or linked or conflicts):
+        if not quiet:
+            print(f"синк: расхождений нет (сессий проверено: {len(candidates)})")
+        if not args.dry_run:
+            meta["last_sync_ts"] = __import__("time").time()
+            store.save_meta(meta)
+        return 0
+
+    def report(label: str, items: list[dict]) -> None:
+        if items and not quiet:
+            print(f"{label}:")
+            for t in items:
+                mark = f"#{t['id']}" if t.get("id") else "новая"
+                print(f"  {mark} {t['title'][:70]}")
+
+    report("закрыто по нативному стору", closed)
+    report("создано из нативного стора", created)
+    report("связано по заголовку", linked)
+    report("реестр прав, натив отстал (не тронуто)", conflicts)
+
+    if args.dry_run:
+        print("\ndry-run: ничего не записано")
+        return 0
+
+    with locked(store):
+        for task in created:
+            task["id"] = store.take_id()
+        for task in closed + created + linked:
+            store.write(task)
+        meta = store.meta()
+        meta["last_sync_ts"] = __import__("time").time()
+        store.save_meta(meta)
+    if not quiet:
+        print(f"\nсинк завершён: закрыто {len(closed)}, создано {len(created)}, связано {len(linked)}")
+    return 0
+
+
+# ---------------------------------------------------------------- migrate
+
+FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
+LEGACY_NAME_RE = re.compile(r"^(open|done|deferred|cancelled|superseded)-(\d+)-(.+)\.md$")
+PREFIX_STATUS = {"open": "open", "deferred": "deferred", "done": "done", "cancelled": "cancelled", "superseded": "cancelled"}
+INLINE_STATUS = {
+    "DONE": "done", "CLOSED": "done", "OPEN": "open", "IN PROGRESS": "open",
+    "TODO": "open", "TO TEST": "open", "CANCELLED": "cancelled", "ОТМЕНЕНО": "cancelled",
+}
+
+
+def parse_frontmatter(text: str) -> tuple[dict, str]:
+    match = FRONTMATTER_RE.match(text)
+    if not match:
+        return {}, text
+    data: dict = {}
+    key = None
+    for line in match.group(1).splitlines():
+        if not line.strip():
+            continue
+        item = re.match(r"^\s*-\s+(.*)$", line)
+        if item and key:
+            data.setdefault(key, [])
+            if isinstance(data[key], list):
+                data[key].append(scalar(item.group(1)))
+            continue
+        pair = re.match(r"^([A-Za-z_][\w-]*)\s*:\s*(.*)$", line)
+        if not pair:
+            continue
+        key = pair.group(1)
+        raw = pair.group(2).strip()
+        data[key] = [] if raw == "" else scalar(raw)
+    return data, text[match.end() :]
+
+
+def scalar(raw: str):
+    raw = raw.strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        inner = raw[1:-1].strip()
+        if not inner:
+            return []
+        return [scalar(part) for part in re.split(r",(?![^\[]*\])", inner)]
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+        return raw[1:-1]
+    low = raw.lower()
+    if low in ("null", "none", "~"):
+        return None
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    if re.match(r"^-?\d+$", raw):
+        return int(raw)
+    return raw
+
+
+def parse_legacy_index(text: str) -> dict[int, dict]:
+    rows: dict[int, dict] = {}
+    section = None
+    for line in text.splitlines():
+        heading = re.match(r"^##\s+(.+?)\s*$", line)
+        if heading:
+            name = heading.group(1).strip().lower()
+            section = {"открытые": "open", "выполненные": "done", "отложенные": "deferred"}.get(name)
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")] if line.strip().startswith("|") else []
+        if len(cells) < 2 or not cells[0].lstrip("#").isdigit() or not cells[1] or set(cells[1]) <= {"-"}:
+            continue
+        tid = int(cells[0].lstrip("#"))
+        row = {"title": cells[1].replace("**", "").strip(), "status": section or "open"}
+        for cell in cells[2:]:
+            token = cell.strip().upper()
+            if token in PRIORITIES:
+                row["priority"] = token
+            elif token in INLINE_STATUS:
+                row["status"] = INLINE_STATUS[token]
+            elif re.match(r"^\d{4}-\d{2}-\d{2}$", cell.strip()):
+                row["closed"] = cell.strip()
+        blocker = cells[3].strip() if len(cells) >= 4 else ""
+        if blocker and blocker not in ("—", "-", "Нет") and blocker.upper() not in INLINE_STATUS:
+            row["blocker_note"] = blocker
+        rows[tid] = row
+    return rows
+
+
+PLAIN_STATUS_WORDS = {
+    "открыта": "open", "открыт": "open", "в работе": "open",
+    "закрыта": "done", "выполнена": "done", "сделана": "done", "готова": "done",
+    "отменена": "cancelled", "отложена": "deferred",
+}
+
+
+def parse_plain_meta(text: str) -> dict:
+    meta: dict = {}
+    for line in text.splitlines()[:20]:
+        pair = re.match(r"^(Создано|Приоритет|Статус)\s*:\s*(.+)$", line.strip())
+        if not pair:
+            continue
+        key, value = pair.group(1), pair.group(2).strip()
+        if key == "Создано" and re.match(r"^\d{4}-\d{2}-\d{2}", value):
+            meta["created"] = value[:10]
+        elif key == "Приоритет" and value.upper() in PRIORITIES:
+            meta["priority"] = value.upper()
+        elif key == "Статус":
+            first = value.split("—")[0].split("(")[0].strip().lower()
+            for word, status in PLAIN_STATUS_WORDS.items():
+                if first.startswith(word):
+                    meta["status"] = status
+                    break
+    return meta
+
+
+def humanize_slug_title(title: str) -> str:
+    slug = re.match(r"^(?:open|done|deferred|cancelled|superseded)-\d+-(.+)$", title)
+    return slug.group(1).replace("-", " ") if slug else title
+
+
+def classify_files(details: Path) -> tuple[list[dict], list[Path]]:
+    entries: list[dict] = []
+    skipped: list[Path] = []
+    for path in sorted(details.rglob("*.md")) if details.is_dir() else []:
+        raw = path.read_text(encoding="utf-8")
+        front, rest = parse_frontmatter(raw)
+        name = LEGACY_NAME_RE.match(path.name)
+        front_id = front.get("id") if isinstance(front.get("id"), int) else None
+        file_id = None
+        date_hint = None
+        if name:
+            num = name.group(2)
+            if len(num) == 8:
+                try:
+                    date_hint = date(int(num[:4]), int(num[4:6]), int(num[6:8])).isoformat()
+                except ValueError:
+                    pass
+            elif int(num) < 10000:
+                file_id = int(num)
+        if front_id is None and file_id is None and name is None:
+            skipped.append(path)
+            continue
+        entries.append({
+            "path": path, "front": front, "body": rest, "name": name,
+            "front_id": front_id, "file_id": file_id, "date_hint": date_hint,
+        })
+    return entries, skipped
+
+
+def cmd_migrate(args, store: Store) -> int:
+    root = store.root
+    details = root / "details"
+    index = root / "tasks.md"
+    queue = root / "queue.md"
+    if not details.is_dir() and not index.is_file():
+        print(f"мигрировать нечего: {root}")
+        return 0
+    if store.tasks_dir.is_dir() and any(store.tasks_dir.glob("*.json")):
+        raise CctmError(f"в {store.tasks_dir} уже есть задачи — миграция отменена")
+
+    legacy_rows = parse_legacy_index(index.read_text(encoding="utf-8")) if index.is_file() else {}
+    bogus_rows = [tid for tid in legacy_rows if tid >= 10000]
+    for tid in bogus_rows:
+        del legacy_rows[tid]
+    entries, skipped = classify_files(details)
+
+    # раздача id: сначала все frontmatter-id, потом имена файлов, потом свежие
+    taken: set[int] = set()
+    reassigned: list[tuple[Path, int]] = []
+    for entry in entries:
+        entry["id"] = None
+        if entry["front_id"] is not None and entry["front_id"] not in taken:
+            entry["id"] = entry["front_id"]
+            taken.add(entry["front_id"])
+    for entry in entries:
+        if entry["id"] is None and entry["file_id"] is not None and entry["file_id"] not in taken:
+            entry["id"] = entry["file_id"]
+            taken.add(entry["file_id"])
+    next_free = max(taken | set(legacy_rows), default=0) + 1
+    for entry in entries:
+        if entry["id"] is None:
+            entry["id"] = next_free
+            taken.add(next_free)
+            reassigned.append((entry["path"], next_free))
+            next_free += 1
+
+    tasks: dict[int, dict] = {}
+    for entry in entries:
+        front, rest, name = entry["front"], entry["body"], entry["name"]
+        tid = entry["id"]
+        row = legacy_rows.get(tid, {})
+        plain = parse_plain_meta(rest) if not front else {}
+        status = front.get("status") if front.get("status") in STATUSES else None
+        if status is None and name:
+            status = PREFIX_STATUS[name.group(1)]
+        if status is None:
+            status = plain.get("status") or row.get("status", "open")
+        title_match = re.search(r"^#\s+(.+?)\s*$", rest, re.MULTILINE)
+        title = (title_match.group(1).strip() if title_match
+                 else row.get("title") or (name.group(3).replace("-", " ") if name else entry["path"].stem))
+        title = humanize_slug_title(title)
+        external = None
+        if front.get("external_id"):
+            external = {"session": None, "id": str(front["external_id"]), "unverified": True}
+        blocked_raw = front.get("blockedBy") or []
+        blocked_ids = [b for b in blocked_raw if isinstance(b, int)]
+        blocked_notes = [str(b) for b in blocked_raw if not isinstance(b, int) and b is not None]
+        if row.get("blocker_note") and not any(row["blocker_note"] in n or n in row["blocker_note"] for n in blocked_notes):
+            blocked_notes.append(row["blocker_note"])
+        body = parse_md(rest)
+        if blocked_notes:
+            body["notes"]["Блокер (из 1.x)"] = "; ".join(blocked_notes)
+        created = str(front.get("created") or plain.get("created") or entry["date_hint"] or today())
+        closed = None
+        if status in TERMINAL:
+            closed = str(front.get("closed") or row.get("closed") or entry["date_hint"] or created)
+        tags = [str(t) for t in (front.get("tags") or [])]
+        if name and name.group(1) == "superseded" and "superseded" not in tags:
+            tags.append("superseded")
+        tasks[tid] = {
+            "id": tid,
+            "title": title,
+            "status": status,
+            "priority": (front.get("priority") if front.get("priority") in PRIORITIES
+                         else plain.get("priority") or row.get("priority", "MEDIUM")),
+            "order": None,
+            "created": created,
+            "updated": today(),
+            "closed": closed,
+            "blockedBy": blocked_ids,
+            "tags": tags,
+            "external": external,
+            "body": body,
+        }
+        entry["final_id"] = tid
+
+    for tid, row in legacy_rows.items():
+        if tid in tasks:
+            continue
+        body = empty_body()
+        body["notes"]["Перенос из 1.x"] = "Задача была только в tasks.md, detail-файла не существовало."
+        if row.get("blocker_note"):
+            body["notes"]["Блокер (из 1.x)"] = row["blocker_note"]
+        status = row["status"]
+        tasks[tid] = {
+            "id": tid,
+            "title": row["title"],
+            "status": status,
+            "priority": row.get("priority", "MEDIUM"),
+            "order": None,
+            "created": row.get("closed") or today(),
+            "updated": today(),
+            "closed": (row.get("closed") or today()) if status in TERMINAL else None,
+            "blockedBy": [],
+            "tags": [],
+            "external": None,
+            "body": body,
+        }
+
+    known = set(tasks)
+    for task in tasks.values():
+        dropped = [b for b in task["blockedBy"] if b not in known]
+        if dropped:
+            task["blockedBy"] = [b for b in task["blockedBy"] if b in known]
+            note = task["body"]["notes"].get("Блокер (из 1.x)", "")
+            extra = "несуществующие: " + ", ".join(f"#{d}" for d in dropped)
+            task["body"]["notes"]["Блокер (из 1.x)"] = f"{note}; {extra}".strip("; ")
+
+    plan = sorted(tasks.values(), key=lambda t: t["id"])
+    by_status = {}
+    for task in plan:
+        by_status[task["status"]] = by_status.get(task["status"], 0) + 1
+    print(f"стор: {root}")
+    print(f"задач к переносу: {len(plan)} (из файлов: {len(entries)}, только из tasks.md: {len(plan) - len(entries)})")
+    print("по статусам: " + ", ".join(f"{s}={n}" for s, n in sorted(by_status.items())))
+    if reassigned:
+        print(f"переназначено id (дубль или дата в имени): {len(reassigned)}")
+        for path, tid in reassigned[: args.preview]:
+            print(f"  {path.relative_to(details)} → #{tid}")
+        if len(reassigned) > args.preview:
+            print(f"  … ещё {len(reassigned) - args.preview}")
+    if skipped:
+        print(f"не задачи, останутся на месте: {len(skipped)}")
+        for path in skipped:
+            print(f"  {path.relative_to(root)}")
+    if args.preview:
+        for task in plan[: args.preview]:
+            print(f"  #{task['id']:<5} {task['status']:<9} {task['priority']:<7} {task['title'][:60]}")
+        if len(plan) > args.preview:
+            print(f"  … ещё {len(plan) - args.preview}")
+
+    if args.dry_run:
+        print("\ndry-run: ничего не записано")
+        if queue.is_file():
+            print("queue.md будет перенесён в бэкап — его содержимое схлопни в тела задач вручную")
+        return 0
+
+    backup = root.parent / f"session.bak-{today().replace('-', '')}"
+    suffix = 1
+    while backup.exists():
+        backup = root.parent / f"session.bak-{today().replace('-', '')}-{suffix}"
+        suffix += 1
+    shutil.copytree(root, backup)
+    print(f"\nбэкап: {backup}")
+
+    with locked(store):
+        store.init()
+        for task in plan:
+            store.write(task)
+        meta = store.meta()
+        meta["version"] = SCHEMA_VERSION
+        meta["next_id"] = max(known) + 1 if known else 1
+        store.save_meta(meta)
+
+    for entry in entries:
+        entry["path"].unlink()
+    for path in (index, queue):
+        if path.is_file():
+            path.unlink()
+            print(f"удалено (копия в бэкапе): {path.name}")
+    for dirpath in sorted(details.rglob("*"), reverse=True):
+        if dirpath.is_dir():
+            with contextlib.suppress(OSError):
+                dirpath.rmdir()
+    with contextlib.suppress(OSError):
+        details.rmdir()
+    print(f"перенесено: {len(plan)} задач → {store.tasks_dir}")
+    if skipped:
+        print("непереносимые файлы оставлены в details/ — разбери вручную:")
+        for path in skipped:
+            print(f"  {path.relative_to(root)}")
+    if queue.name and (backup / "queue.md").exists():
+        print("queue.md ушёл в бэкап — схлопни его содержимое в тела задач при следующем /finalize")
+    if args.preview:
+        print("\nкарта переноса (проверь ссылки в CLAUDE.md, memory, ADR):")
+        for entry in entries[: args.preview]:
+            print(f"  details/{entry['path'].relative_to(details)} → tasks/{entry['final_id']:03d}.json")
+        if len(entries) > args.preview:
+            print(f"  … ещё {len(entries) - args.preview}")
+    else:
+        print(f"старые имена файлов больше не существуют — проверь ссылки на details/ в CLAUDE.md, memory, ADR")
+        print(f"полная карта: cctm --root {store.root} migrate --dry-run (по бэкапу) или см. {backup}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="cctm", description="Реестр задач проекта")
+    parser.add_argument("--root", help="путь к .claude/session (по умолчанию ищется от cwd вверх)")
+    parser.add_argument("--no-auto-migrate", action="store_true", help="не мигрировать формат 1.x автоматически")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("init", help="создать стор").set_defaults(func=cmd_init)
+
+    p = sub.add_parser("create", help="создать задачу")
+    p.add_argument("--title", required=True)
+    p.add_argument("--priority", choices=PRIORITIES)
+    p.add_argument("--status", default="open", choices=STATUSES)
+    p.add_argument("--tags")
+    p.add_argument("--blocked-by")
+    p.add_argument("--order", type=int)
+    p.add_argument("--md", help="файл с телом задачи или - для stdin")
+    p.set_defaults(func=cmd_create)
+
+    p = sub.add_parser("set", help="записать тело задачи")
+    p.add_argument("id", type=int)
+    p.add_argument("--md")
+    p.add_argument("--json", dest="json")
+    p.add_argument("--replace", action="store_true", help="заменить тело целиком")
+    p.set_defaults(func=cmd_set)
+
+    p = sub.add_parser("update", help="изменить метаданные")
+    p.add_argument("id", type=int)
+    p.add_argument("--title")
+    p.add_argument("--priority", choices=PRIORITIES)
+    p.add_argument("--status", choices=STATUSES)
+    p.add_argument("--tags")
+    p.add_argument("--add-tag")
+    p.add_argument("--blocked-by")
+    p.add_argument("--order", type=int)
+    p.set_defaults(func=cmd_update)
+
+    p = sub.add_parser("close", help="закрыть задачу")
+    p.add_argument("id", type=int)
+    p.add_argument("--md")
+    p.set_defaults(func=cmd_close)
+
+    p = sub.add_parser("reopen", help="открыть заново")
+    p.add_argument("id", type=int)
+    p.set_defaults(func=cmd_reopen)
+
+    p = sub.add_parser("delete", help="удалить задачу")
+    p.add_argument("id", type=int)
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_delete)
+
+    p = sub.add_parser("list", help="список задач")
+    p.add_argument("--status", default="active", choices=("active", *STATUSES, "all"))
+    p.add_argument("--priority", choices=PRIORITIES)
+    p.add_argument("--tag")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("next", help="что делать дальше")
+    p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_next)
+
+    p = sub.add_parser("show", help="показать задачу")
+    p.add_argument("id", type=int)
+    p.add_argument("--md", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("grep", help="поиск по телам задач")
+    p.add_argument("pattern")
+    p.add_argument("--context", type=int, default=3)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_grep)
+
+    p = sub.add_parser("export", help="markdown-дамп реестра")
+    p.add_argument("--md", action="store_true")
+    p.add_argument("--out")
+    p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("doctor", help="проверка инвариантов")
+    p.add_argument("--fix", action="store_true")
+    p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("sync", help="синхронизация с нативным стором Claude Code")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--session", help="uuid или session-XXXXXXXX конкретной сессии")
+    p.add_argument("--all", action="store_true", help="все сессии проекта, не только свежие")
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--from-hook", action="store_true", help="читать payload хука из stdin")
+    p.set_defaults(func=cmd_sync)
+
+    p = sub.add_parser("migrate", help="перенос формата 1.x → 2.0")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--preview", type=int, default=20)
+    p.add_argument("--path", help="корень проекта (по умолчанию — текущий)")
+    p.set_defaults(func=cmd_migrate)
+
+    return parser
+
+
+def auto_migrate(store: Store, legacy: int) -> None:
+    print(f"формат 1.x: {legacy} файлов в {store.root} — мигрирую в JSON-стор", file=sys.stderr)
+    sub = argparse.Namespace(dry_run=False, preview=0, path=None)
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        cmd_migrate(sub, store)
+    sys.stderr.write(buffer.getvalue().rstrip() + "\n")
+    problems = argparse.Namespace(fix=True)
+    check = io.StringIO()
+    with contextlib.redirect_stdout(check):
+        cmd_doctor(problems, store)
+    sys.stderr.write(check.getvalue().rstrip() + "\n---\n")
+
+
+def main(argv: list[str]) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "migrate" and getattr(args, "path", None):
+        store = Store(Path(args.path).resolve() / ".claude" / "session")
+    else:
+        store = Store(Path(args.root).resolve() if args.root else find_root())
+    if args.command not in ("init", "migrate") and not store.exists():
+        legacy = store.legacy_count()
+        if legacy and (getattr(args, "quiet", False) or getattr(args, "from_hook", False)):
+            return 0
+        if legacy and args.no_auto_migrate:
+            print(
+                f"обнаружен формат 1.x: {legacy} файлов в {store.root}\n"
+                f"запусти `cctm migrate --dry-run`, затем `cctm migrate` — init создаст пустой стор поверх",
+                file=sys.stderr,
+            )
+            return 3
+        if legacy:
+            auto_migrate(store, legacy)
+            return args.func(args, store)
+        if getattr(args, "json", False):
+            json.dump([], sys.stdout, ensure_ascii=False)
+            print()
+            return 0
+        print(f"стор не найден: {store.root} (cctm init)")
+        return 0 if args.command in ("list", "next", "grep", "export", "doctor", "sync") else 1
+    return args.func(args, store)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except CctmError as exc:
+        print(f"cctm: {exc}", file=sys.stderr)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+
