@@ -31,5 +31,5 @@ case ":$PATH:" in
   *) echo "  warning: $BIN_DIR is not in PATH" ;;
 esac
 echo ""
-echo "Note: hooks (TaskCompleted/SessionEnd autosync) work only with plugin install."
+echo "Note: hooks (TaskCompleted sync, SessionEnd sync+handoff) work only with plugin install."
 echo "Usage: /ts, /finalize, /rs; CLI: cctm --help"

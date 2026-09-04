@@ -8,7 +8,9 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
+import time
 from datetime import date
 from pathlib import Path
 
@@ -18,6 +20,11 @@ STATUSES = ("open", "deferred", "done", "cancelled")
 TERMINAL = ("done", "cancelled")
 PRIORITY_RANK = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
 ACTIVE = ("open", "deferred")
+
+HANDOFF_VERSION = 1
+HANDOFF_KEEP = 20
+HANDOFF_MAX_CHARS = 20000
+HANDOFF_FRESH_HOURS = 48
 
 TEXT_FIELDS = ("description", "context", "precondition", "verify", "result")
 LIST_FIELDS = ("plan", "files")
@@ -89,6 +96,10 @@ class Store:
         return self.root / "tasks"
 
     @property
+    def handoff_dir(self) -> Path:
+        return self.root / "handoff"
+
+    @property
     def meta_path(self) -> Path:
         return self.root / "meta.json"
 
@@ -130,9 +141,13 @@ class Store:
             return None
         return read_json(path)
 
-    def write(self, task: dict) -> None:
+    def write(self, task: dict, touch: bool = True) -> None:
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
         task["updated"] = today()
+        if touch:
+            key = session_key(session_uuid())
+            if key != "unknown":
+                task["session"] = key
         write_json(self.path_of(task["id"]), task)
 
     def remove(self, tid: int) -> None:
@@ -376,6 +391,7 @@ def cmd_create(args, store: Store) -> int:
             "created": today(),
             "updated": today(),
             "closed": None,
+            "created_by": session_key(session_uuid()),
             "blockedBy": blocked,
             "tags": parse_tags(args.tags),
             "external": None,
@@ -420,6 +436,7 @@ def cmd_update(args, store: Store) -> int:
                 raise CctmError(f"статус: {', '.join(STATUSES)}")
             task["status"] = args.status
             task["closed"] = today() if args.status in TERMINAL else None
+            task["closed_by"] = session_key(session_uuid()) if args.status in TERMINAL else None
         if args.tags is not None:
             task["tags"] = parse_tags(args.tags)
         if args.add_tag:
@@ -450,6 +467,7 @@ def cmd_close(args, store: Store) -> int:
             task["body"] = merge_body(task.get("body") or {}, parse_md(read_source(args.md)))
         task["status"] = "done"
         task["closed"] = today()
+        task["closed_by"] = session_key(session_uuid())
         store.write(task)
     print(f"#{args.id} закрыта: {task['title']}")
     return 0
@@ -460,6 +478,7 @@ def cmd_reopen(args, store: Store) -> int:
         task = require(store, args.id)
         task["status"] = "open"
         task["closed"] = None
+        task["closed_by"] = None
         store.write(task)
     print(f"#{args.id} открыта заново: {task['title']}")
     return 0
@@ -475,7 +494,7 @@ def cmd_delete(args, store: Store) -> int:
             blocked = other.get("blockedBy") or []
             if args.id in blocked:
                 other["blockedBy"] = [b for b in blocked if b != args.id]
-                store.write(other)
+                store.write(other, touch=False)
     print(f"#{args.id} удалена: {task['title']}")
     return 0
 
@@ -660,7 +679,7 @@ def cmd_doctor(args, store: Store) -> int:
         if not closed_ok:
             if args.fix:
                 task["closed"] = today() if task.get("status") in TERMINAL else None
-                store.write(task)
+                store.write(task, touch=False)
                 fixed.append(f"#{tid}: closed приведён к статусу")
             else:
                 problems.append(f"#{tid}: closed не соответствует статусу")
@@ -692,10 +711,22 @@ def cmd_doctor(args, store: Store) -> int:
     if int(meta.get("version", 0)) != SCHEMA_VERSION:
         problems.append(f"версия схемы {meta.get('version')}, ожидается {SCHEMA_VERSION}")
 
+    handoffs = 0
+    for path in sorted(store.handoff_dir.glob("*.json")) if store.handoff_dir.is_dir() else []:
+        try:
+            record = read_json(path)
+        except (json.JSONDecodeError, OSError) as exc:
+            problems.append(f"handoff/{path.name}: не парсится ({exc})")
+            continue
+        if not record.get("ts") or not record.get("key"):
+            problems.append(f"handoff/{path.name}: нет ts или key")
+            continue
+        handoffs += 1
+
     for note in fixed:
         print(f"починено: {note}")
     if not problems:
-        print(f"инвариантов нарушено нет · задач: {len(tasks)}")
+        print(f"инвариантов нарушено нет · задач: {len(tasks)} · handoff: {handoffs}")
         return 0
     for note in problems:
         print(f"проблема: {note}")
@@ -807,7 +838,7 @@ def cmd_sync(args, store: Store) -> int:
         candidates = [d for d in (claude_home() / "tasks" / wanted, claude_home() / "tasks" / args.session) if d.is_dir()]
     elif not args.all:
         current = f"session-{session_env[:8]}" if session_env else None
-        cutoff = last_sync or (__import__("time").time() - 7 * 86400)
+        cutoff = last_sync or (time.time() - 7 * 86400)
         candidates = [d for d in candidates if d.name == current or dir_mtime(d) > cutoff]
 
     if not candidates:
@@ -847,6 +878,8 @@ def cmd_sync(args, store: Store) -> int:
                     "created": today(),
                     "updated": today(),
                     "closed": today() if native_done else None,
+                    "created_by": session_key(session_uuid()),
+                    "closed_by": session_key(session_uuid()) if native_done else None,
                     "blockedBy": [],
                     "tags": [],
                     "external": {"session": ndir.name, "id": str(native["id"])},
@@ -859,6 +892,7 @@ def cmd_sync(args, store: Store) -> int:
             if native_done and task.get("status") in ACTIVE:
                 task["status"] = "done"
                 task["closed"] = today()
+                task["closed_by"] = session_key(session_uuid())
                 closed.append(task)
             elif not native_done and task.get("status") in TERMINAL:
                 conflicts.append(task)
@@ -867,7 +901,7 @@ def cmd_sync(args, store: Store) -> int:
         if not quiet:
             print(f"синк: расхождений нет (сессий проверено: {len(candidates)})")
         if not args.dry_run:
-            meta["last_sync_ts"] = __import__("time").time()
+            meta["last_sync_ts"] = time.time()
             store.save_meta(meta)
         return 0
 
@@ -893,7 +927,7 @@ def cmd_sync(args, store: Store) -> int:
         for task in closed + created + linked:
             store.write(task)
         meta = store.meta()
-        meta["last_sync_ts"] = __import__("time").time()
+        meta["last_sync_ts"] = time.time()
         store.save_meta(meta)
     if not quiet:
         print(f"\nсинк завершён: закрыто {len(closed)}, создано {len(created)}, связано {len(linked)}")
@@ -1205,7 +1239,7 @@ def cmd_migrate(args, store: Store) -> int:
     with locked(store):
         store.init()
         for task in plan:
-            store.write(task)
+            store.write(task, touch=False)
         meta = store.meta()
         meta["version"] = SCHEMA_VERSION
         meta["next_id"] = max(known) + 1 if known else 1
@@ -1239,6 +1273,434 @@ def cmd_migrate(args, store: Store) -> int:
     else:
         print(f"старые имена файлов больше не существуют — проверь ссылки на details/ в CLAUDE.md, memory, ADR")
         print(f"полная карта: cctm --root {store.root} migrate --dry-run (по бэкапу) или см. {backup}")
+    return 0
+
+
+# ---------------------------------------------------------------- handoff
+
+def hook_payload() -> dict:
+    try:
+        if sys.stdin is None or sys.stdin.closed or sys.stdin.isatty():
+            return {}
+        data = json.load(sys.stdin)
+    except (json.JSONDecodeError, ValueError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+SESSION_OVERRIDE = ""
+
+
+def session_uuid(explicit: str | None = None) -> str:
+    value = (explicit or SESSION_OVERRIDE or os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+    return value[len("session-") :] if value.startswith("session-") else value
+
+
+def session_key(uuid: str) -> str:
+    return uuid[:8] if uuid else "unknown"
+
+
+def parse_iso_ts(value) -> float | None:
+    from datetime import datetime
+
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def git_state(project_root: Path) -> dict:
+    def run(*cmd: str) -> str | None:
+        try:
+            done = subprocess.run(cmd, cwd=str(project_root), capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return done.stdout.strip() if done.returncode == 0 else None
+
+    branch = run("git", "rev-parse", "--abbrev-ref", "HEAD") or run("git", "symbolic-ref", "--short", "HEAD")
+    if branch is None:
+        return {}
+    status = run("git", "status", "--porcelain") or ""
+    return {
+        "branch": branch,
+        "head": run("git", "rev-parse", "--short", "HEAD") or "",
+        "dirty": len([line for line in status.splitlines() if line.strip()]),
+    }
+
+
+def transcript_of(project_root: Path, uuid: str) -> Path | None:
+    if not uuid:
+        return None
+    proj = claude_home() / "projects" / project_slug(project_root)
+    exact = proj / f"{uuid}.jsonl"
+    if exact.is_file():
+        return exact
+    if not proj.is_dir():
+        return None
+    matches = sorted(proj.glob(f"{uuid[:8]}*.jsonl"))
+    return matches[0] if matches else None
+
+
+def transcript_started_at(path: Path) -> float | None:
+    try:
+        with path.open(encoding="utf-8") as fh:
+            for index, line in enumerate(fh):
+                if index >= 5:
+                    break
+                if not line.strip():
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                stamp = parse_iso_ts(data.get("timestamp")) if isinstance(data, dict) else None
+                if stamp:
+                    return stamp
+    except OSError:
+        return None
+    return None
+
+
+def session_window(store: Store, uuid: str) -> tuple[float | None, float | None]:
+    path = transcript_of(store.root.parent.parent, uuid)
+    if path is None:
+        return None, None
+    try:
+        return transcript_started_at(path), path.stat().st_mtime
+    except OSError:
+        return None, None
+
+
+def session_tasks(store: Store, uuid: str) -> tuple[list[dict], list[dict], list[dict]]:
+    key = session_key(uuid)
+    if key == "unknown" or not store.tasks_dir.is_dir():
+        return [], [], []
+    mine = [t for t in store.all() if key in (t.get("session"), t.get("created_by"), t.get("closed_by"))]
+    closed = [t for t in mine if t.get("status") in TERMINAL and t.get("closed_by") == key]
+    done_ids = {t["id"] for t in closed}
+    created = [t for t in mine if t.get("created_by") == key and t["id"] not in done_ids]
+    known = done_ids | {t["id"] for t in created}
+    rest = [t for t in mine if t["id"] not in known and t.get("status") not in TERMINAL]
+    return closed, created, rest
+
+
+def read_handoffs(store: Store) -> list[dict]:
+    if not store.handoff_dir.is_dir():
+        return []
+    records = []
+    for path in sorted(store.handoff_dir.glob("*.json")):
+        try:
+            data = read_json(path)
+        except (json.JSONDecodeError, OSError):
+            continue
+        if isinstance(data, dict) and data.get("ts"):
+            data["_path"] = str(path)
+            records.append(data)
+    return sorted(records, key=lambda r: float(r.get("ts") or 0), reverse=True)
+
+
+def pick_handoff(records: list[dict], wanted: str | None) -> dict | None:
+    if not records:
+        return None
+    if not wanted or wanted == "latest":
+        return records[0]
+    key = session_key(session_uuid(wanted))
+    for record in records:
+        if record.get("key") == key or str(record.get("session") or "").startswith(key):
+            return record
+    return None
+
+
+def prune_handoffs(store: Store, keep: int, days: int = 0) -> int:
+    records = read_handoffs(store)
+    doomed = list(records[keep:]) if keep > 0 else []
+    if days > 0:
+        cutoff = time.time() - days * 86400
+        doomed.extend(r for r in records[:keep] if float(r.get("ts") or 0) < cutoff)
+    for record in doomed:
+        with contextlib.suppress(OSError):
+            Path(record["_path"]).unlink()
+    return len(doomed)
+
+
+def first_line(text: str) -> str:
+    for line in (text or "").splitlines():
+        if line.strip():
+            return re.sub(r"^#+\s*", "", line.strip())
+    return ""
+
+
+def h1_of(text: str) -> str:
+    for line in (text or "").splitlines():
+        heading = re.match(r"^#\s+(.+?)\s*$", line.strip())
+        if heading:
+            return heading.group(1)
+    return ""
+
+
+def handoff_stamp(record: dict) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(record.get("ts") or 0)))
+
+
+def handoff_title(record: dict) -> str:
+    return record.get("title") or first_line(record.get("body") or "")
+
+
+def wrote_after_handoff(store: Store, record: dict) -> bool:
+    _, last = session_window(store, str(record.get("session") or ""))
+    return bool(last and last > float(record.get("ts") or 0) + 300)
+
+
+def task_lines(store: Store, ids: list[int]) -> list[str]:
+    lines = []
+    for tid in ids:
+        task = store.read(int(tid))
+        if task is None:
+            lines.append(f"#{tid} (нет в реестре)")
+        else:
+            lines.append(f"#{tid} {task.get('status')} {str(task.get('title') or '')[:60]}")
+    return lines
+
+
+def handoff_head(record: dict, current: str) -> str:
+    git = record.get("git") or {}
+    where = git.get("branch") or ""
+    if where and git.get("head"):
+        where += f"@{git['head']}"
+    if where and git.get("dirty"):
+        where += f", не закоммичено файлов: {git['dirty']}"
+    marks = []
+    if record.get("key") == current:
+        marks.append("эта сессия")
+    if record.get("kind") == "auto":
+        marks.append("авто, без финализации")
+    head = f"Handoff {record.get('key')} · {handoff_stamp(record)}"
+    if where:
+        head += f" · {where}"
+    if marks:
+        head += " · " + ", ".join(marks)
+    return head
+
+
+def strip_h1(text: str, title: str) -> str:
+    lines = (text or "").splitlines()
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        heading = re.match(r"^#\s+(.+?)\s*$", line.strip())
+        if heading and heading.group(1).strip() == title.strip():
+            return "\n".join(lines[index + 1 :]).strip()
+        break
+    return (text or "").strip()
+
+
+def render_handoff(record: dict, store: Store, current: str) -> str:
+    out = [f"# {handoff_head(record, current)}", ""]
+    title = record.get("title")
+    if title:
+        out.extend([f"**{title}**", ""])
+    tasks = record.get("tasks") or {}
+    for field, label in (("closed", "Закрыто"), ("created", "Заведено"), ("touched", "Тронуто")):
+        ids = [int(i) for i in tasks.get(field) or []]
+        if not ids:
+            continue
+        out.append(f"## {label}")
+        out.extend(f"- {line}" for line in task_lines(store, ids))
+        out.append("")
+    body = strip_h1(record.get("body") or "", record.get("title") or "")
+    if body:
+        out.extend([body, ""])
+    return "\n".join(out).rstrip() + "\n"
+
+
+def write_handoff(store: Store, record: dict, keep: int) -> int:
+    store.handoff_dir.mkdir(parents=True, exist_ok=True)
+    write_json(store.handoff_dir / f"{record['key']}.json", record)
+    return prune_handoffs(store, keep)
+
+
+def cmd_handoff_write(args, store: Store) -> int:
+    uuid = session_uuid(args.session)
+    text = read_source(args.md).strip()
+    if not text:
+        raise CctmError("тело handoff пустое")
+    if len(text) > HANDOFF_MAX_CHARS:
+        raise CctmError(f"тело {len(text)} символов, максимум {HANDOFF_MAX_CHARS}: handoff — сводка, не дневник")
+    with locked(store):
+        store.init()
+    auto_closed, auto_created, auto_touched = session_tasks(store, uuid)
+    closed = parse_ids(args.closed) or [t["id"] for t in auto_closed]
+    created = parse_ids(args.created) or [t["id"] for t in auto_created]
+    touched = [t for t in (parse_ids(args.touched) or [t["id"] for t in auto_touched]) if t not in closed and t not in created]
+    project_root = store.root.parent.parent
+    record = {
+        "version": HANDOFF_VERSION,
+        "key": session_key(uuid),
+        "session": uuid,
+        "kind": "final",
+        "ts": time.time(),
+        "date": today(),
+        "title": (args.title or h1_of(text)).strip()[:120],
+        "cwd": str(project_root),
+        "git": git_state(project_root),
+        "tasks": {"closed": closed, "created": created, "touched": touched},
+        "body": text,
+    }
+    dropped = write_handoff(store, record, args.keep)
+    if not args.quiet:
+        print(f"handoff {record['key']} записан · закрыто {len(closed)}, заведено {len(created)}, тронуто {len(touched)}")
+        if dropped:
+            print(f"вытеснено старых handoff: {dropped}")
+    return 0
+
+
+def cmd_handoff_auto(args, store: Store) -> int:
+    uuid = session_uuid(args.session)
+    if not uuid or not store.exists():
+        return 0
+    closed, created, rest = session_tasks(store, uuid)
+    touched = closed + created + rest
+    if not touched:
+        return 0
+    key = session_key(uuid)
+    path = store.handoff_dir / f"{key}.json"
+    previous = None
+    if path.is_file():
+        with contextlib.suppress(json.JSONDecodeError, OSError):
+            existing = read_json(path)
+            newest = max((store.path_of(t["id"]).stat().st_mtime for t in touched), default=0)
+            if existing.get("kind") == "final":
+                if float(existing.get("ts") or 0) >= newest:
+                    return 0
+                previous = existing
+    if previous is not None:
+        seen = set()
+        for field in ("closed", "created", "touched"):
+            seen.update(int(i) for i in (previous.get("tasks") or {}).get(field) or [])
+        fresh = [t for t in touched if t["id"] not in seen]
+        lines = ["## После финализации",
+                 "Сессия работала после /finalize и закрылась без повторной финализации."]
+        if fresh:
+            lines.extend(f"- #{t['id']} {t.get('status')} {t.get('title', '')}" for t in fresh)
+        else:
+            lines.append("Новых задач нет, менялись уже перечисленные — сверься с `cctm show N`.")
+        merged = dict(previous.get("tasks") or {})
+        for field, group in (("closed", closed), ("created", created), ("touched", rest)):
+            ids = list(dict.fromkeys([int(i) for i in merged.get(field) or []] + [t["id"] for t in group]))
+            merged[field] = ids
+        record = dict(previous)
+        record.update({
+            "ts": time.time(),
+            "date": today(),
+            "git": git_state(store.root.parent.parent),
+            "tasks": merged,
+            "body": (previous.get("body") or "").strip() + "\n\n" + "\n".join(lines),
+        })
+        write_handoff(store, record, args.keep)
+        if not args.quiet:
+            print(f"handoff {key} дополнен после финализации · новых задач {len(fresh)}")
+        return 0
+    lines = [
+        "## Состояние",
+        "Сессия закончилась без /finalize — handoff собран автоматически по изменениям реестра.",
+        "Списки выше полные, текста от модели нет: тела задач могут быть неполными, сверься с `cctm show N`.",
+    ]
+    project_root = store.root.parent.parent
+    record = {
+        "version": HANDOFF_VERSION,
+        "key": key,
+        "session": uuid,
+        "kind": "auto",
+        "ts": time.time(),
+        "date": today(),
+        "title": f"без финализации: закрыто {len(closed)}, заведено {len(created)}, в работе {len(rest)}",
+        "cwd": str(project_root),
+        "git": git_state(project_root),
+        "tasks": {"closed": [t["id"] for t in closed], "created": [t["id"] for t in created], "touched": [t["id"] for t in rest]},
+        "body": "\n".join(lines).strip(),
+    }
+    write_handoff(store, record, args.keep)
+    if not args.quiet:
+        print(f"handoff {key} записан автоматически · закрыто {len(closed)}, заведено {len(created)}, в работе {len(rest)}")
+    return 0
+
+
+def cmd_handoff_list(args, store: Store) -> int:
+    records = read_handoffs(store)
+    if args.json:
+        json.dump([{k: v for k, v in r.items() if k != "_path"} for r in records[: args.limit]], sys.stdout, ensure_ascii=False, indent=2)
+        print()
+        return 0
+    if not records:
+        print("handoff нет")
+        return 0
+    current = session_key(session_uuid())
+    for record in records[: args.limit]:
+        tasks = record.get("tasks") or {}
+        counts = f"закрыто {len(tasks.get('closed') or [])} · тронуто {len(tasks.get('touched') or [])}"
+        marks = []
+        if record.get("key") == current:
+            marks.append("эта сессия")
+        if record.get("kind") == "auto":
+            marks.append("авто")
+        if wrote_after_handoff(store, record):
+            marks.append("сессия писала после handoff")
+        row = f"{handoff_stamp(record)}  {str(record.get('key')):<10} {counts:<30} {handoff_title(record)[:50]}"
+        if marks:
+            row += "  [" + ", ".join(marks) + "]"
+        print(row)
+    return 0
+
+
+def cmd_handoff_show(args, store: Store) -> int:
+    records = read_handoffs(store)
+    wanted = getattr(args, "session", None)
+    record = pick_handoff(records, wanted)
+    if record is None:
+        if not records:
+            print("handoff нет")
+            return 0
+        print(f"handoff не найден: {wanted}")
+        return 1
+    if args.json:
+        json.dump({k: v for k, v in record.items() if k != "_path"}, sys.stdout, ensure_ascii=False, indent=2)
+        print()
+        return 0
+    current = session_key(session_uuid())
+    sys.stdout.write(render_handoff(record, store, current))
+    cutoff = time.time() - args.hours * 3600
+    others = [r for r in records if r is not record and float(r.get("ts") or 0) >= cutoff]
+    if others:
+        print()
+        print(f"параллельно писали ещё сессий: {len(others)} (за {args.hours}ч)")
+        for other in others[:5]:
+            mark = " · сессия писала после handoff" if wrote_after_handoff(store, other) else ""
+            print(f"  {handoff_stamp(other)} {other.get('key')} — {handoff_title(other)[:60]}{mark}")
+        print(f"  подробности: cctm handoff show <key>")
+    return 0
+
+
+def cmd_handoff_prune(args, store: Store) -> int:
+    dropped = prune_handoffs(store, args.keep, args.days)
+    print(f"удалено handoff: {dropped}")
+    return 0
+
+
+def cmd_session_end(args, store: Store) -> int:
+    payload = hook_payload() if args.from_hook else {}
+    if payload.get("cwd"):
+        store = Store(find_root(payload["cwd"]))
+    if not store.exists():
+        return 0
+    uuid = session_uuid(payload.get("session_id") or args.session)
+    global SESSION_OVERRIDE
+    SESSION_OVERRIDE = uuid
+    with contextlib.suppress(Exception):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            cmd_sync(argparse.Namespace(quiet=True, from_hook=False, dry_run=False, session=None, all=False), store)
+    with contextlib.suppress(Exception):
+        cmd_handoff_auto(argparse.Namespace(session=uuid, quiet=True, keep=args.keep), store)
     return 0
 
 
@@ -1333,6 +1795,54 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--from-hook", action="store_true", help="читать payload хука из stdin")
     p.set_defaults(func=cmd_sync)
 
+    p = sub.add_parser("handoff", help="снимок сессии для передачи следующей")
+    hsub = p.add_subparsers(dest="handoff_command", required=True)
+
+    h = hsub.add_parser("write", help="записать handoff текущей сессии")
+    h.add_argument("--md", required=True, help="файл с телом handoff или - для stdin")
+    h.add_argument("--title")
+    h.add_argument("--closed", help="id закрытых задач через запятую")
+    h.add_argument("--created", help="id заведённых задач")
+    h.add_argument("--touched", help="id задач, которых касались")
+    h.add_argument("--session", help="uuid сессии (по умолчанию CLAUDE_CODE_SESSION_ID)")
+    h.add_argument("--keep", type=int, default=HANDOFF_KEEP)
+    h.add_argument("--quiet", action="store_true")
+    h.set_defaults(func=cmd_handoff_write)
+
+    h = hsub.add_parser("auto", help="технический handoff по изменениям реестра")
+    h.add_argument("--session")
+    h.add_argument("--keep", type=int, default=HANDOFF_KEEP)
+    h.add_argument("--quiet", action="store_true")
+    h.set_defaults(func=cmd_handoff_auto)
+
+    h = hsub.add_parser("list", help="handoff всех сессий, свежие сверху")
+    h.add_argument("--limit", type=int, default=10)
+    h.add_argument("--json", action="store_true")
+    h.set_defaults(func=cmd_handoff_list)
+
+    h = hsub.add_parser("show", help="показать handoff сессии")
+    h.add_argument("session", nargs="?", help="key сессии или latest")
+    h.add_argument("--hours", type=int, default=HANDOFF_FRESH_HOURS)
+    h.add_argument("--json", action="store_true")
+    h.set_defaults(func=cmd_handoff_show)
+
+    h = hsub.add_parser("latest", help="самый свежий handoff")
+    h.add_argument("--hours", type=int, default=HANDOFF_FRESH_HOURS)
+    h.add_argument("--json", action="store_true")
+    h.set_defaults(func=cmd_handoff_show, session=None)
+
+    h = hsub.add_parser("prune", help="почистить старые handoff")
+    h.add_argument("--keep", type=int, default=HANDOFF_KEEP)
+    h.add_argument("--days", type=int, default=0)
+    h.set_defaults(func=cmd_handoff_prune)
+
+    p = sub.add_parser("session-end", help="хук конца сессии: sync + автоматический handoff")
+    p.add_argument("--session")
+    p.add_argument("--keep", type=int, default=HANDOFF_KEEP)
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--from-hook", action="store_true", help="читать payload хука из stdin")
+    p.set_defaults(func=cmd_session_end)
+
     p = sub.add_parser("migrate", help="перенос формата 1.x → 2.0")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--preview", type=int, default=20)
@@ -1363,7 +1873,7 @@ def main(argv: list[str]) -> int:
         store = Store(Path(args.path).resolve() / ".claude" / "session")
     else:
         store = Store(Path(args.root).resolve() if args.root else find_root())
-    if args.command not in ("init", "migrate") and not store.exists():
+    if args.command not in ("init", "migrate", "handoff", "session-end") and not store.exists():
         legacy = store.legacy_count()
         if legacy and (getattr(args, "quiet", False) or getattr(args, "from_hook", False)):
             return 0

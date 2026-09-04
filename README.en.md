@@ -48,6 +48,11 @@ cctm grep "auth"      # search task bodies
 cctm sync             # reconcile with Claude Code native tasks
 cctm doctor           # invariant check
 cctm export --md      # human-readable dump
+
+cctm handoff latest   # snapshot of the last session
+cctm handoff list     # who finalized and when, parallel sessions included
+cctm handoff show ab12cd34
+cctm handoff write --md handoff.md
 ```
 
 ## Storage
@@ -55,8 +60,9 @@ cctm export --md      # human-readable dump
 `.claude/session/` of the target project:
 
 ```
-meta.json        id counter, schema version
-tasks/007.json   one task = one file, complete
+meta.json               id counter, schema version
+tasks/007.json          one task = one file, complete
+handoff/ab12cd34.json   session snapshot: one file per session
 ```
 
 Statuses: `open`, `deferred`, `done`, `cancelled`. No markdown files in the store,
@@ -66,8 +72,28 @@ no duplicated state — the index is built on the fly.
 
 Claude Code keeps its own tasks (TaskCreate/TaskUpdate) in `~/.claude/tasks/session-*/`.
 `cctm sync` finds the project's sessions, matches tasks (by the `external` link, then by title)
-and carries the state into the registry. The `TaskCompleted` and `SessionEnd` hooks run the sync
-automatically — an interrupted session no longer leaves the registry stale.
+and carries the state into the registry. The `TaskCompleted` hook runs the sync automatically,
+`SessionEnd` runs sync plus handoff (`cctm session-end`) — an interrupted session no longer leaves
+the registry stale.
+
+## Session handoff
+
+Tasks say "what", the handoff says "where we stopped". Written by `/finalize`, read by `/rs`.
+
+One file per session (`handoff/<first 8 chars of the session id>.json`), so parallel sessions
+never overwrite each other: `cctm handoff latest` returns the freshest one and states on a separate
+line how many other sessions wrote in parallel — `cctm handoff list` shows them all.
+
+Task lists are filled in automatically: every edit stamps the task with the session id
+(`session`, `created_by` in the task JSON), so another session's work never lands in your handoff.
+
+The `SessionEnd` hook keeps the handoff honest:
+
+- session ended without `/finalize` but touched tasks → a technical handoff (`kind: auto`);
+- work continued after `/finalize` → an "После финализации" block is appended, the hand-written
+  summary is never overwritten.
+
+The last 20 are kept; `cctm handoff prune --keep N --days D` for manual cleanup.
 
 ## Migrating from 1.x
 
