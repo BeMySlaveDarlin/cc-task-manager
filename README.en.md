@@ -76,6 +76,45 @@ and carries the state into the registry. The `TaskCompleted` hook runs the sync 
 `SessionEnd` runs sync plus handoff (`cctm session-end`) — an interrupted session no longer leaves
 the registry stale.
 
+### Hooks
+
+| Event | Command | What it does |
+|---|---|---|
+| `SessionStart` | `cctm session-start` | puts the previous session's context into the new one |
+| `TaskCompleted` | `cctm sync` | carries the task status into the registry |
+| `SessionEnd` | `cctm session-end` | sync + handoff for an interrupted session |
+
+Hooks stay inside their own project: the store is taken from the current directory or from the
+git repository root, never higher. In a directory without a store the hook exits quietly instead
+of picking up someone else's registry one level up.
+
+## Context at session start
+
+Tasks and handoffs are useless until the agent has read them. The `/rs` skill fires on a user
+phrase ("let's continue", "where did we stop") — which means it may not fire at all.
+The `SessionStart` hook doesn't ask: it puts the summary into the new session's context itself.
+
+About 15 lines are injected: the latest handoff header, its title, task counters, the
+"Следующий шаг" (next step) section and the top three tasks from `cctm next`. The full handoff
+body stays with `/rs` — pouring it in on every start would just burn context.
+
+The injection happens on `startup` and `clear`; `resume` and `fork` are skipped — the transcript
+is already restored there.
+
+Per-project mode — the `session_start` key in `meta.json`:
+
+```
+"session_start": "brief"   default: summary
+"session_start": "full"    the whole handoff
+"session_start": "off"     disabled
+```
+
+To see what would go into the context:
+
+```
+cctm session-start --raw
+```
+
 ## Session handoff
 
 Tasks say "what", the handoff says "where we stopped". Written by `/finalize`, read by `/rs`.

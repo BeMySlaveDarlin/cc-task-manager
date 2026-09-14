@@ -26,6 +26,12 @@ HANDOFF_KEEP = 20
 HANDOFF_MAX_CHARS = 20000
 HANDOFF_FRESH_HOURS = 48
 
+SESSION_START_MODES = ("off", "brief", "full")
+SESSION_START_SOURCES = ("startup", "clear")
+SESSION_START_NEXT = 3
+SESSION_START_STEP_LINES = 8
+SESSION_START_STEP_CHARS = 700
+
 TEXT_FIELDS = ("description", "context", "precondition", "verify", "result")
 LIST_FIELDS = ("plan", "files")
 
@@ -75,6 +81,19 @@ def empty_body() -> dict:
     body.update({f: [] for f in LIST_FIELDS})
     body["notes"] = {}
     return body
+
+
+def hook_root(cwd: str | None = None) -> Path | None:
+    cur = Path(cwd or os.getcwd()).resolve()
+    roots = [cur]
+    for d in [cur, *cur.parents]:
+        if (d / ".git").exists():
+            roots.append(d)
+            break
+    for d in roots:
+        if (d / ".claude" / "session").is_dir():
+            return d / ".claude" / "session"
+    return None
 
 
 def find_root(start: str | None = None) -> Path:
@@ -337,6 +356,14 @@ def blockers_of(task: dict, by_id: dict[int, dict]) -> list[int]:
     return [b for b in task.get("blockedBy") or [] if by_id.get(b, {}).get("status") != "done"]
 
 
+def split_next(store: Store) -> tuple[list[dict], list[dict], dict[int, dict]]:
+    tasks = store.all()
+    by_id = {t["id"]: t for t in tasks}
+    ready = [t for t in tasks if t.get("status") == "open" and not blockers_of(t, by_id)]
+    blocked = [t for t in tasks if t.get("status") == "open" and blockers_of(t, by_id)]
+    return sorted(ready, key=sort_key), sorted(blocked, key=sort_key), by_id
+
+
 def format_row(task: dict, by_id: dict[int, dict]) -> str:
     tags = ",".join(task.get("tags") or [])
     blocked = blockers_of(task, by_id)
@@ -530,14 +557,12 @@ def cmd_list(args, store: Store) -> int:
 
 
 def cmd_next(args, store: Store) -> int:
-    tasks = store.all()
-    by_id = {t["id"]: t for t in tasks}
-    ready = [t for t in tasks if t.get("status") == "open" and not blockers_of(t, by_id)]
-    blocked = [t for t in tasks if t.get("status") == "open" and blockers_of(t, by_id)]
-    ready = sorted(ready, key=sort_key)[: args.limit]
+    ready, blocked, by_id = split_next(store)
+    ready = ready[: args.limit]
     if args.json:
+        deferred = [t for t in by_id.values() if t.get("status") == "deferred"]
         json.dump(
-            {"ready": ready, "blocked": sorted(blocked, key=sort_key), "deferred": [t for t in tasks if t.get("status") == "deferred"]},
+            {"ready": ready, "blocked": blocked, "deferred": sorted(deferred, key=sort_key)},
             sys.stdout,
             ensure_ascii=False,
             indent=2,
@@ -547,7 +572,7 @@ def cmd_next(args, store: Store) -> int:
     print_tasks(ready, by_id, "открытых задач нет")
     if blocked:
         print("\nзаблокированы:")
-        print_tasks(sorted(blocked, key=sort_key), by_id, "")
+        print_tasks(blocked, by_id, "")
     return 0
 
 
@@ -818,10 +843,11 @@ def titles_match(a: str, b: str) -> bool:
 def cmd_sync(args, store: Store) -> int:
     quiet = args.quiet
     if args.from_hook:
-        with contextlib.suppress(Exception):
-            payload = json.load(sys.stdin)
-            if isinstance(payload, dict) and payload.get("cwd"):
-                store = Store(find_root(payload["cwd"]))
+        payload = hook_payload()
+        root = hook_root(payload.get("cwd"))
+        if root is None:
+            return 0
+        store = Store(root)
     if not store.exists():
         if not quiet:
             print(f"стор не найден: {store.root} — синк пропущен")
@@ -1688,8 +1714,11 @@ def cmd_handoff_prune(args, store: Store) -> int:
 
 def cmd_session_end(args, store: Store) -> int:
     payload = hook_payload() if args.from_hook else {}
-    if payload.get("cwd"):
-        store = Store(find_root(payload["cwd"]))
+    if args.from_hook:
+        root = hook_root(payload.get("cwd"))
+        if root is None:
+            return 0
+        store = Store(root)
     if not store.exists():
         return 0
     uuid = session_uuid(payload.get("session_id") or args.session)
@@ -1701,6 +1730,121 @@ def cmd_session_end(args, store: Store) -> int:
             cmd_sync(argparse.Namespace(quiet=True, from_hook=False, dry_run=False, session=None, all=False), store)
     with contextlib.suppress(Exception):
         cmd_handoff_auto(argparse.Namespace(session=uuid, quiet=True, keep=args.keep), store)
+    return 0
+
+
+# ---------------------------------------------------------------- session start
+
+def md_section(text: str, names: tuple[str, ...]) -> str:
+    wanted = {name.lower() for name in names}
+    out: list[str] = []
+    depth = 0
+    for line in (text or "").splitlines():
+        heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if heading:
+            level = len(heading.group(1))
+            if not depth:
+                if heading.group(2).strip().lower() in wanted:
+                    depth = level
+                continue
+            if level <= depth:
+                break
+        if depth:
+            out.append(line)
+    return "\n".join(out).strip()
+
+
+def clamp_text(text: str, max_lines: int, max_chars: int) -> str:
+    lines = text.splitlines()
+    cut = len(lines) > max_lines
+    body = "\n".join(lines[:max_lines])
+    if len(body) > max_chars:
+        body = body[:max_chars].rstrip()
+        cut = True
+    return body + (" …" if cut else "")
+
+
+def session_start_mode(store: Store) -> str:
+    try:
+        value = str(store.meta().get("session_start") or "brief").strip().lower()
+    except (json.JSONDecodeError, OSError):
+        return "brief"
+    return value if value in SESSION_START_MODES else "brief"
+
+
+def session_start_text(store: Store, mode: str) -> str:
+    current = session_key(session_uuid())
+    record = pick_handoff(read_handoffs(store), None)
+    out: list[str] = []
+    if record is not None and mode == "full":
+        out.append(render_handoff(record, store, current).rstrip())
+    elif record is not None:
+        out.append(handoff_head(record, current))
+        title = handoff_title(record)
+        if title:
+            out.append(f"**{title}**")
+        tasks = record.get("tasks") or {}
+        counts = [
+            f"{label} {len(tasks.get(field) or [])}"
+            for field, label in (("closed", "закрыто"), ("created", "заведено"), ("touched", "тронуто"))
+            if tasks.get(field)
+        ]
+        if counts:
+            out.append("задачи: " + " · ".join(counts))
+        step = md_section(record.get("body") or "", ("следующий шаг", "next step"))
+        if step:
+            out.extend(["", "### Следующий шаг", clamp_text(step, SESSION_START_STEP_LINES, SESSION_START_STEP_CHARS)])
+    ready, blocked, by_id = split_next(store)
+    if ready:
+        out.extend(["", "### Очередь"] if out else [])
+        out.extend(format_row(task, by_id) for task in ready[:SESSION_START_NEXT])
+        rest = []
+        if len(ready) > SESSION_START_NEXT:
+            rest.append(f"ещё открытых: {len(ready) - SESSION_START_NEXT}")
+        if blocked:
+            rest.append(f"заблокировано: {len(blocked)}")
+        if rest:
+            out.append(" · ".join(rest))
+    if not out:
+        return ""
+    head = "Контекст прошлой сессии" if record is not None else "Очередь задач"
+    return "\n".join([f"## {head} (cc-task-manager)", ""] + out + ["", "полный контекст: /rs · задачи: /ts"])
+
+
+def cmd_session_start(args, store: Store) -> int:
+    payload = hook_payload() if args.from_hook else {}
+    if args.from_hook:
+        root = hook_root(payload.get("cwd"))
+        if root is None:
+            return 0
+        store = Store(root)
+    if not store.exists():
+        return 0
+    source = str(payload.get("source") or args.source or "startup").strip().lower()
+    if source not in SESSION_START_SOURCES:
+        return 0
+    global SESSION_OVERRIDE
+    SESSION_OVERRIDE = session_uuid(payload.get("session_id") or args.session)
+    mode = args.mode or session_start_mode(store)
+    if mode == "off":
+        return 0
+    try:
+        text = session_start_text(store, mode)
+    except Exception as exc:
+        if not args.quiet:
+            print(f"cctm session-start: {exc}", file=sys.stderr)
+        return 0
+    if not text.strip():
+        return 0
+    if args.raw:
+        print(text)
+        return 0
+    json.dump(
+        {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}},
+        sys.stdout,
+        ensure_ascii=False,
+    )
+    print()
     return 0
 
 
@@ -1843,6 +1987,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--from-hook", action="store_true", help="читать payload хука из stdin")
     p.set_defaults(func=cmd_session_end)
 
+    p = sub.add_parser("session-start", help="хук старта сессии: контекст прошлой сессии")
+    p.add_argument("--session")
+    p.add_argument("--source", default="startup", help="startup|clear|resume|fork")
+    p.add_argument("--mode", choices=SESSION_START_MODES, help="переопределить meta.session_start")
+    p.add_argument("--raw", action="store_true", help="печатать текст вместо JSON для хука")
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--from-hook", action="store_true", help="читать payload хука из stdin")
+    p.set_defaults(func=cmd_session_start)
+
     p = sub.add_parser("migrate", help="перенос формата 1.x → 2.0")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--preview", type=int, default=20)
@@ -1873,7 +2026,7 @@ def main(argv: list[str]) -> int:
         store = Store(Path(args.path).resolve() / ".claude" / "session")
     else:
         store = Store(Path(args.root).resolve() if args.root else find_root())
-    if args.command not in ("init", "migrate", "handoff", "session-end") and not store.exists():
+    if args.command not in ("init", "migrate", "handoff", "session-end", "session-start") and not store.exists():
         legacy = store.legacy_count()
         if legacy and (getattr(args, "quiet", False) or getattr(args, "from_hook", False)):
             return 0
