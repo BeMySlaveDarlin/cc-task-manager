@@ -1410,6 +1410,19 @@ def session_tasks(store: Store, uuid: str) -> tuple[list[dict], list[dict], list
     return closed, created, rest
 
 
+def split_task_groups(closed: list[int], created: list[int], touched: list[int]) -> dict[str, list[int]]:
+    seen: set[int] = set()
+    groups: dict[str, list[int]] = {}
+    for field, ids in (("closed", closed), ("created", created), ("touched", touched)):
+        unique = []
+        for task_id in (int(i) for i in ids):
+            if task_id not in seen:
+                seen.add(task_id)
+                unique.append(task_id)
+        groups[field] = unique
+    return groups
+
+
 def read_handoffs(store: Store) -> list[dict]:
     if not store.handoff_dir.is_dir():
         return []
@@ -1555,9 +1568,12 @@ def cmd_handoff_write(args, store: Store) -> int:
     with locked(store):
         store.init()
     auto_closed, auto_created, auto_touched = session_tasks(store, uuid)
-    closed = parse_ids(args.closed) or [t["id"] for t in auto_closed]
-    created = parse_ids(args.created) or [t["id"] for t in auto_created]
-    touched = [t for t in (parse_ids(args.touched) or [t["id"] for t in auto_touched]) if t not in closed and t not in created]
+    groups = split_task_groups(
+        parse_ids(args.closed) or [t["id"] for t in auto_closed],
+        parse_ids(args.created) or [t["id"] for t in auto_created],
+        parse_ids(args.touched) or [t["id"] for t in auto_touched],
+    )
+    closed, created, touched = groups["closed"], groups["created"], groups["touched"]
     project_root = store.root.parent.parent
     record = {
         "version": HANDOFF_VERSION,
@@ -1611,9 +1627,12 @@ def cmd_handoff_auto(args, store: Store) -> int:
         else:
             lines.append("Новых задач нет, менялись уже перечисленные — сверься с `cctm show N`.")
         merged = dict(previous.get("tasks") or {})
-        for field, group in (("closed", closed), ("created", created), ("touched", rest)):
-            ids = list(dict.fromkeys([int(i) for i in merged.get(field) or []] + [t["id"] for t in group]))
-            merged[field] = ids
+        was = {f: [int(i) for i in merged.get(f) or []] for f in ("closed", "created", "touched")}
+        merged.update(split_task_groups(
+            was["closed"] + [t["id"] for t in closed],
+            was["created"] + [t["id"] for t in created],
+            was["touched"] + [t["id"] for t in rest],
+        ))
         record = dict(previous)
         record.update({
             "ts": time.time(),
@@ -1642,7 +1661,7 @@ def cmd_handoff_auto(args, store: Store) -> int:
         "title": f"без финализации: закрыто {len(closed)}, заведено {len(created)}, в работе {len(rest)}",
         "cwd": str(project_root),
         "git": git_state(project_root),
-        "tasks": {"closed": [t["id"] for t in closed], "created": [t["id"] for t in created], "touched": [t["id"] for t in rest]},
+        "tasks": split_task_groups([t["id"] for t in closed], [t["id"] for t in created], [t["id"] for t in rest]),
         "body": "\n".join(lines).strip(),
     }
     write_handoff(store, record, args.keep)
@@ -1689,11 +1708,18 @@ def cmd_handoff_show(args, store: Store) -> int:
         print(f"handoff не найден: {wanted}")
         return 1
     if args.json:
-        json.dump({k: v for k, v in record.items() if k != "_path"}, sys.stdout, ensure_ascii=False, indent=2)
-        print()
+        text = json.dumps({k: v for k, v in record.items() if k != "_path"}, ensure_ascii=False, indent=2) + "\n"
+    else:
+        text = render_handoff(record, store, session_key(session_uuid()))
+    if args.out:
+        path = Path(args.out).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        print(f"handoff {record.get('key')} записан: {path}")
         return 0
-    current = session_key(session_uuid())
-    sys.stdout.write(render_handoff(record, store, current))
+    sys.stdout.write(text)
+    if args.json:
+        return 0
     cutoff = time.time() - args.hours * 3600
     others = [r for r in records if r is not record and float(r.get("ts") or 0) >= cutoff]
     if others:
@@ -1764,6 +1790,34 @@ def clamp_text(text: str, max_lines: int, max_chars: int) -> str:
     return body + (" …" if cut else "")
 
 
+def self_path() -> Path:
+    return Path(__file__).resolve()
+
+
+def plugin_version(cctm: Path | None = None) -> str:
+    manifest = (cctm or self_path()).parent.parent / ".claude-plugin" / "plugin.json"
+    try:
+        return str(read_json(manifest).get("version") or "")
+    except (json.JSONDecodeError, OSError):
+        return ""
+
+
+def version_warning() -> list[str]:
+    mine = self_path()
+    found = shutil.which("cctm")
+    if found and Path(found).resolve() == mine:
+        return []
+    actual = plugin_version() or "?"
+    if not found:
+        head = f"cctm нет в PATH (актуальная версия {actual})."
+    else:
+        stale = plugin_version(Path(found).resolve()) or "?"
+        if stale == actual:
+            return []
+        head = f"cctm в PATH — версия {stale}, актуальная {actual}."
+    return [f"⚠ {head}", f"Зови по пути: {mine}"]
+
+
 def session_start_mode(store: Store) -> str:
     try:
         value = str(store.meta().get("session_start") or "brief").strip().lower()
@@ -1805,10 +1859,16 @@ def session_start_text(store: Store, mode: str) -> str:
             rest.append(f"заблокировано: {len(blocked)}")
         if rest:
             out.append(" · ".join(rest))
-    if not out:
+    warn = version_warning()
+    if not out and not warn:
         return ""
     head = "Контекст прошлой сессии" if record is not None else "Очередь задач"
-    return "\n".join([f"## {head} (cc-task-manager)", ""] + out + ["", "полный контекст: /rs · задачи: /ts"])
+    lines = [f"## {head} (cc-task-manager)", ""]
+    if warn:
+        lines.extend(warn + [""])
+    if out:
+        lines.extend(out + ["", "полный контекст: /rs · задачи: /ts"])
+    return "\n".join(lines).rstrip()
 
 
 def cmd_session_start(args, store: Store) -> int:
@@ -1852,6 +1912,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="cctm", description="Реестр задач проекта")
     parser.add_argument("--root", help="путь к .claude/session (по умолчанию ищется от cwd вверх)")
     parser.add_argument("--no-auto-migrate", action="store_true", help="не мигрировать формат 1.x автоматически")
+    parser.add_argument("--version", action="version", version=f"cctm {plugin_version() or 'unknown'} ({self_path()})")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="создать стор").set_defaults(func=cmd_init)
@@ -1968,11 +2029,13 @@ def build_parser() -> argparse.ArgumentParser:
     h.add_argument("session", nargs="?", help="key сессии или latest")
     h.add_argument("--hours", type=int, default=HANDOFF_FRESH_HOURS)
     h.add_argument("--json", action="store_true")
+    h.add_argument("--out", help="записать в файл вместо stdout")
     h.set_defaults(func=cmd_handoff_show)
 
     h = hsub.add_parser("latest", help="самый свежий handoff")
     h.add_argument("--hours", type=int, default=HANDOFF_FRESH_HOURS)
     h.add_argument("--json", action="store_true")
+    h.add_argument("--out", help="записать в файл вместо stdout")
     h.set_defaults(func=cmd_handoff_show, session=None)
 
     h = hsub.add_parser("prune", help="почистить старые handoff")
