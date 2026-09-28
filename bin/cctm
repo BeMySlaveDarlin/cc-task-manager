@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -24,7 +25,12 @@ ACTIVE = ("open", "deferred")
 HANDOFF_VERSION = 1
 HANDOFF_KEEP = 20
 HANDOFF_MAX_CHARS = 20000
+HANDOFF_ATTACH_MAX_MB = 20
 HANDOFF_FRESH_HOURS = 48
+HANDOFF_KEEP_PER_PLACE = 3
+TOUCHED_KEEP = 20
+LIVE_MINUTES = 30
+SESSION_START_OTHERS = 5
 
 SESSION_START_MODES = ("off", "brief", "full")
 SESSION_START_SOURCES = ("startup", "clear")
@@ -83,32 +89,114 @@ def empty_body() -> dict:
     return body
 
 
-def hook_root(cwd: str | None = None) -> Path | None:
-    cur = Path(cwd or os.getcwd()).resolve()
-    roots = [cur]
-    for d in [cur, *cur.parents]:
+def is_within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def git_toplevel(start: Path) -> Path | None:
+    for d in [start, *start.parents]:
         if (d / ".git").exists():
-            roots.append(d)
-            break
-    for d in roots:
-        if (d / ".claude" / "session").is_dir():
-            return d / ".claude" / "session"
+            return d
     return None
 
 
-def find_root(start: str | None = None) -> Path:
-    cur = Path(start or os.getcwd()).resolve()
-    for d in [cur, *cur.parents]:
+def git_dir(top: Path) -> Path | None:
+    marker = top / ".git"
+    if marker.is_dir():
+        return marker
+    try:
+        text = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text.startswith("gitdir:"):
+        return None
+    path = Path(text[len("gitdir:") :].strip())
+    return path if path.is_absolute() else (top / path).resolve()
+
+
+def main_checkout(top: Path) -> Path:
+    gitdir = git_dir(top)
+    if gitdir is None or gitdir == top / ".git":
+        return top
+    try:
+        common = (gitdir / (gitdir / "commondir").read_text(encoding="utf-8").strip()).resolve()
+    except OSError:
+        return top
+    return common.parent if common.name == ".git" else top
+
+
+def worktree_paths(main: Path) -> list[Path]:
+    paths = [main]
+    registry = main / ".git" / "worktrees"
+    if not registry.is_dir():
+        return paths
+    for entry in sorted(registry.iterdir()):
+        with contextlib.suppress(OSError):
+            path = Path((entry / "gitdir").read_text(encoding="utf-8").strip()).parent.resolve()
+            if path not in paths:
+                paths.append(path)
+    return paths
+
+
+def head_branch(top: Path | None) -> str:
+    gitdir = git_dir(top) if top is not None else None
+    if gitdir is None:
+        return ""
+    try:
+        head = (gitdir / "HEAD").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    prefix = "ref: refs/heads/"
+    return head[len(prefix) :] if head.startswith(prefix) else ""
+
+
+def locate_store(cwd: str | None = None, strict: bool = False) -> tuple[Path | None, Path]:
+    cur = Path(cwd or os.getcwd()).resolve()
+    top = git_toplevel(cur)
+    stop = top
+    if top is None:
+        anchor = session_anchor()
+        if anchor is not None and is_within(cur, anchor):
+            stop = anchor
+    chain = [cur]
+    if stop is not None or not strict:
+        home = Path.home().resolve()
+        chain = []
+        for d in [cur, *cur.parents]:
+            if stop is None and d == home and cur != home:
+                break
+            chain.append(d)
+            if d == stop:
+                break
+    for d in chain:
         if (d / ".claude" / "session").is_dir():
-            return d / ".claude" / "session"
-        if (d / ".git").exists():
-            return d / ".claude" / "session"
-    return cur / ".claude" / "session"
+            return d / ".claude" / "session", d / ".claude" / "session"
+    if top is None:
+        default = (stop or cur) / ".claude" / "session"
+        return None, default
+    main = main_checkout(top)
+    default = main / ".claude" / "session"
+    if default.is_dir():
+        return default, default
+    anchor = session_anchor()
+    if anchor is not None and anchor != top and is_within(cur, anchor) and (anchor / ".claude" / "session").is_dir():
+        return anchor / ".claude" / "session", anchor / ".claude" / "session"
+    return None, default
+
+
+def hook_root(cwd: str | None = None) -> Path | None:
+    return locate_store(cwd, strict=True)[0]
+
+
+def find_root(start: str | None = None) -> Path:
+    found, default = locate_store(start)
+    return found or default
 
 
 class Store:
     def __init__(self, root: Path):
         self.root = Path(root)
+        self._places: list[Path] | None = None
 
     @property
     def tasks_dir(self) -> Path:
@@ -160,13 +248,15 @@ class Store:
             return None
         return read_json(path)
 
-    def write(self, task: dict, touch: bool = True) -> None:
+    def write(self, task: dict, touch: bool = True, by: str | None = None) -> None:
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
         task["updated"] = today()
         if touch:
-            key = session_key(session_uuid())
+            key = by or session_key(session_uuid())
             if key != "unknown":
                 task["session"] = key
+                touched = [k for k in task.get("touched_by") or [] if k != key]
+                task["touched_by"] = (touched + [key])[-TOUCHED_KEEP:]
         write_json(self.path_of(task["id"]), task)
 
     def remove(self, tid: int) -> None:
@@ -356,15 +446,22 @@ def blockers_of(task: dict, by_id: dict[int, dict]) -> list[int]:
     return [b for b in task.get("blockedBy") or [] if by_id.get(b, {}).get("status") != "done"]
 
 
-def split_next(store: Store) -> tuple[list[dict], list[dict], dict[int, dict]]:
+def branch_key(branch: str):
+    if not branch:
+        return sort_key
+    return lambda task: (task.get("branch") != branch, *sort_key(task))
+
+
+def split_next(store: Store, branch: str = "") -> tuple[list[dict], list[dict], dict[int, dict]]:
     tasks = store.all()
     by_id = {t["id"]: t for t in tasks}
     ready = [t for t in tasks if t.get("status") == "open" and not blockers_of(t, by_id)]
     blocked = [t for t in tasks if t.get("status") == "open" and blockers_of(t, by_id)]
-    return sorted(ready, key=sort_key), sorted(blocked, key=sort_key), by_id
+    key = branch_key(branch)
+    return sorted(ready, key=key), sorted(blocked, key=key), by_id
 
 
-def format_row(task: dict, by_id: dict[int, dict]) -> str:
+def format_row(task: dict, by_id: dict[int, dict], live: dict[str, str] | None = None) -> str:
     tags = ",".join(task.get("tags") or [])
     blocked = blockers_of(task, by_id)
     title = task.get("title", "")
@@ -375,15 +472,17 @@ def format_row(task: dict, by_id: dict[int, dict]) -> str:
         row += f"  [{tags}]"
     if blocked:
         row += "  блокер: " + ", ".join(f"#{b}" for b in blocked)
+    if live and task.get("session") in live:
+        row += f"  ⚑ {live[task['session']]}"
     return row.rstrip()
 
 
-def print_tasks(tasks: list[dict], by_id: dict[int, dict], empty: str) -> None:
+def print_tasks(tasks: list[dict], by_id: dict[int, dict], empty: str, live: dict[str, str] | None = None) -> None:
     if not tasks:
         print(empty)
         return
     for task in tasks:
-        print(format_row(task, by_id))
+        print(format_row(task, by_id, live))
 
 
 def cmd_init(args, store: Store) -> int:
@@ -424,6 +523,9 @@ def cmd_create(args, store: Store) -> int:
             "external": None,
             "body": body,
         }
+        branch = cwd_branch()
+        if branch:
+            task["branch"] = branch
         store.write(task)
     print(f"#{tid} создана: {task['title']}")
     if not args.md:
@@ -543,12 +645,12 @@ def select(tasks: list[dict], status: str, priority: str | None, tag: str | None
 def cmd_list(args, store: Store) -> int:
     tasks = store.all()
     by_id = {t["id"]: t for t in tasks}
-    selected = select(tasks, args.status, args.priority, args.tag)
+    selected = sorted(select(tasks, args.status, args.priority, args.tag), key=branch_key(worktree_branch()))
     if args.json:
         json.dump(selected, sys.stdout, ensure_ascii=False, indent=2)
         print()
         return 0
-    print_tasks(selected, by_id, "задач нет")
+    print_tasks(selected, by_id, "задач нет", live_marks(store))
     if args.status == "active":
         done = len([t for t in tasks if t.get("status") == "done"])
         if done:
@@ -557,7 +659,8 @@ def cmd_list(args, store: Store) -> int:
 
 
 def cmd_next(args, store: Store) -> int:
-    ready, blocked, by_id = split_next(store)
+    branch = worktree_branch()
+    ready, blocked, by_id = split_next(store, branch)
     ready = ready[: args.limit]
     if args.json:
         deferred = [t for t in by_id.values() if t.get("status") == "deferred"]
@@ -569,10 +672,18 @@ def cmd_next(args, store: Store) -> int:
         )
         print()
         return 0
-    print_tasks(ready, by_id, "открытых задач нет")
+    live = live_marks(store)
+    own = [t for t in ready if branch and t.get("branch") == branch]
+    if own and len(own) < len(ready):
+        print(f"ветка {branch}:")
+        print_tasks(own, by_id, "", live)
+        print("\nостальные:")
+        print_tasks(ready[len(own) :], by_id, "", live)
+    else:
+        print_tasks(ready, by_id, "открытых задач нет", live)
     if blocked:
         print("\nзаблокированы:")
-        print_tasks(blocked, by_id, "")
+        print_tasks(blocked, by_id, "", live)
     return 0
 
 
@@ -595,6 +706,10 @@ def cmd_show(args, store: Store) -> int:
         meta += " · блокеры: " + ", ".join(f"#{b}" for b in task["blockedBy"])
     if task.get("external"):
         meta += f" · натив: {task['external'].get('session')}/{task['external'].get('id')}"
+    if task.get("branch"):
+        meta += f" · ветка {task['branch']}"
+    if task.get("merged_from"):
+        meta += f" · перенесена из {task['merged_from'].get('store')} как #{task['merged_from'].get('id')}"
     print(head)
     print(meta)
     print()
@@ -736,6 +851,17 @@ def cmd_doctor(args, store: Store) -> int:
     if int(meta.get("version", 0)) != SCHEMA_VERSION:
         problems.append(f"версия схемы {meta.get('version')}, ожидается {SCHEMA_VERSION}")
 
+    project = store.root.parent.parent.resolve()
+    top = git_toplevel(project)
+    if top == project:
+        main = main_checkout(top)
+        if main != top:
+            problems.append(f"стор лежит в ворктри, основной чекаут {main}: cctm --root {main / '.claude' / 'session'} merge {store.root}")
+        for path in worktree_paths(main)[1:]:
+            fork = path / ".claude" / "session"
+            if path != top and fork.is_dir():
+                problems.append(f"у ворктри {path} свой стор: cctm --root {main / '.claude' / 'session'} merge {fork}")
+
     handoffs = 0
     for path in sorted(store.handoff_dir.glob("*.json")) if store.handoff_dir.is_dir() else []:
         try:
@@ -747,6 +873,12 @@ def cmd_doctor(args, store: Store) -> int:
             problems.append(f"handoff/{path.name}: нет ts или key")
             continue
         handoffs += 1
+    legacy = legacy_handoffs(store)
+    if legacy and args.fix:
+        with locked(store):
+            fixed.append(f"handoff переименовано по дате и ветке: {rename_legacy_handoffs(store)}")
+    elif legacy:
+        problems.append(f"handoff со старыми именами <key>.json: {len(legacy)} (cctm doctor --fix)")
 
     for note in fixed:
         print(f"починено: {note}")
@@ -784,6 +916,90 @@ def find_cycle(graph: dict[int, list[int]]) -> list[int]:
     return []
 
 
+def cmd_merge(args, store: Store) -> int:
+    source_root = Path(args.source).expanduser().resolve()
+    if (source_root / ".claude" / "session").is_dir():
+        source_root = source_root / ".claude" / "session"
+    source = Store(source_root)
+    if not source.exists():
+        raise CctmError(f"стор-источник не найден: {source_root}")
+    if source.root.resolve() == store.root.resolve():
+        raise CctmError("источник совпадает с целевым стором")
+    incoming = source.all()
+    records = read_handoffs(source)
+    existing = store.all() if store.exists() else []
+    known_keys = {r.get("key") for r in read_handoffs(store)}
+    dups = {}
+    for task in incoming:
+        match = next((e for e in existing if titles_match(e.get("title", ""), task.get("title", ""))), None)
+        if match is not None:
+            dups[task["id"]] = match
+
+    def plan() -> dict[int, int]:
+        base = max([int(store.meta().get("next_id", 1)), *(t["id"] + 1 for t in store.all())])
+        return {task["id"]: base + index for index, task in enumerate(incoming)}
+
+    mapping = plan()
+    print(f"перенос: {source.root} → {store.root}")
+    for task in incoming:
+        mark = f"  [возможный дубль #{dups[task['id']]['id']}]" if task["id"] in dups else ""
+        print(f"  #{task['id']} → #{mapping[task['id']]} {task.get('status')} {str(task.get('title', ''))[:60]}{mark}")
+    moved = [r for r in records if r.get("key") not in known_keys]
+    skipped = [r for r in records if r.get("key") in known_keys]
+    print(f"handoff: перенести {len(moved)}" + (f", уже есть: {', '.join(str(r.get('key')) for r in skipped)}" if skipped else ""))
+    if args.dry_run:
+        print("\ndry-run: ничего не записано")
+        return 0
+
+    with locked(store):
+        store.init()
+        mapping = plan()
+        for task in incoming:
+            copy = json.loads(json.dumps(task))
+            copy["id"] = mapping[task["id"]]
+            copy["blockedBy"] = [mapping[b] for b in task.get("blockedBy") or [] if b in mapping]
+            copy["merged_from"] = {"store": str(source.root), "id": task["id"]}
+            dup = dups.get(task["id"])
+            if dup is not None:
+                tags = list(copy.get("tags") or [])
+                if "dup" not in tags:
+                    tags.append("dup")
+                copy["tags"] = tags
+                if isinstance(copy.get("body"), dict):
+                    notes = dict(copy["body"].get("notes") or {})
+                    notes["Слияние"] = f"Возможный дубль #{dup['id']} «{dup.get('title', '')}». Сверь и закрой лишнюю."
+                    copy["body"]["notes"] = notes
+            store.write(copy, touch=False)
+        meta = store.meta()
+        meta["next_id"] = max(mapping.values(), default=int(meta.get("next_id", 1)) - 1) + 1
+        store.save_meta(meta)
+        store.handoff_dir.mkdir(parents=True, exist_ok=True)
+        for record in moved:
+            copy = {k: v for k, v in record.items() if k != "_path"}
+            tasks = copy.get("tasks") or {}
+            copy["tasks"] = {
+                field: [mapping[int(i)] for i in tasks.get(field) or [] if int(i) in mapping]
+                for field in ("closed", "created", "touched")
+            }
+            copy["worktree"] = handoff_place(copy) or str(source.root.parent.parent)
+            copy["merged_from"] = str(source.root)
+            folder = attachments_dir(Path(record["_path"]))
+            if folder.is_dir():
+                shutil.copytree(folder, attachments_dir(handoff_target(store, copy)), dirs_exist_ok=True)
+            store_handoff(store, copy)
+    print(f"\nперенесено задач: {len(incoming)}, handoff: {len(moved)}, возможных дублей: {len(dups)} (тег dup)")
+    if not args.keep_source:
+        target = source.root.with_name(f"session-merged-{today()}")
+        suffix = 1
+        while target.exists():
+            suffix += 1
+            target = source.root.with_name(f"session-merged-{today()}-{suffix}")
+        source.root.rename(target)
+        print(f"источник переименован: {target}")
+    print("номера задач в текстах остались старыми — старый номер виден в cctm show N")
+    return 0
+
+
 # ---------------------------------------------------------------- sync
 
 def claude_home() -> Path:
@@ -794,12 +1010,11 @@ def project_slug(path: Path) -> str:
     return str(path).replace("/", "-").replace(".", "-").replace("_", "-")
 
 
-def native_dirs(project_root: Path) -> list[Path]:
+def native_dirs(store: Store) -> list[Path]:
     home = claude_home()
-    proj = home / "projects" / project_slug(project_root)
     dirs: list[Path] = []
     seen: set[Path] = set()
-    for transcript in proj.glob("*.jsonl"):
+    for transcript in (t for folder in transcript_dirs(store) for t in folder.glob("*.jsonl")):
         uuid = transcript.stem
         for cand in (home / "tasks" / f"session-{uuid[:8]}", home / "tasks" / uuid):
             if cand.is_dir() and cand not in seen:
@@ -841,9 +1056,11 @@ def titles_match(a: str, b: str) -> bool:
 
 
 def cmd_sync(args, store: Store) -> int:
+    global SESSION_OVERRIDE
     quiet = args.quiet
     if args.from_hook:
         payload = hook_payload()
+        SESSION_OVERRIDE = session_uuid(payload.get("session_id"))
         root = hook_root(payload.get("cwd"))
         if root is None:
             return 0
@@ -853,12 +1070,11 @@ def cmd_sync(args, store: Store) -> int:
             print(f"стор не найден: {store.root} — синк пропущен")
         return 0
 
-    project_root = store.root.parent.parent
-    session_env = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    session_env = session_uuid()
     meta = store.meta()
     last_sync = float(meta.get("last_sync_ts") or 0)
 
-    candidates = native_dirs(project_root)
+    candidates = native_dirs(store)
     if args.session:
         wanted = args.session if args.session.startswith("session-") else f"session-{args.session[:8]}"
         candidates = [d for d in (claude_home() / "tasks" / wanted, claude_home() / "tasks" / args.session) if d.is_dir()]
@@ -869,7 +1085,7 @@ def cmd_sync(args, store: Store) -> int:
 
     if not candidates:
         if not quiet:
-            print(f"нативный стор: подходящих сессий нет (искал в {claude_home() / 'tasks'} по {claude_home() / 'projects' / project_slug(project_root)})")
+            print(f"нативный стор: подходящих сессий нет (искал в {claude_home() / 'tasks'} по транскриптам {', '.join(str(p) for p in project_places(store))})")
         return 0
 
     tasks = store.all()
@@ -880,7 +1096,9 @@ def cmd_sync(args, store: Store) -> int:
             by_external[(ext["session"], str(ext["id"]))] = task
 
     closed, created, linked, conflicts = [], [], [], []
+    owners: dict[int, str] = {}
     for ndir in candidates:
+        owner = session_key(session_uuid(ndir.name))
         for native in read_native(ndir):
             key = (ndir.name, str(native["id"]))
             native_done = native.get("status") in ("completed", "done", "cancelled")
@@ -892,6 +1110,7 @@ def cmd_sync(args, store: Store) -> int:
                     if not (match.get("external") or {}).get("session"):
                         task["external"] = {"session": ndir.name, "id": str(native["id"])}
                         linked.append(task)
+                        owners[id(task)] = owner
             if task is None:
                 body = empty_body()
                 body["description"] = native.get("description") or ""
@@ -904,22 +1123,27 @@ def cmd_sync(args, store: Store) -> int:
                     "created": today(),
                     "updated": today(),
                     "closed": today() if native_done else None,
-                    "created_by": session_key(session_uuid()),
-                    "closed_by": session_key(session_uuid()) if native_done else None,
+                    "created_by": owner,
+                    "closed_by": owner if native_done else None,
                     "blockedBy": [],
                     "tags": [],
                     "external": {"session": ndir.name, "id": str(native["id"])},
                     "body": body,
                 }
+                branch = cwd_branch()
+                if branch:
+                    new["branch"] = branch
                 created.append(new)
+                owners[id(new)] = owner
                 tasks.append(new)
                 by_external[key] = new
                 continue
             if native_done and task.get("status") in ACTIVE:
                 task["status"] = "done"
                 task["closed"] = today()
-                task["closed_by"] = session_key(session_uuid())
+                task["closed_by"] = owner
                 closed.append(task)
+                owners[id(task)] = owner
             elif not native_done and task.get("status") in TERMINAL:
                 conflicts.append(task)
 
@@ -951,7 +1175,7 @@ def cmd_sync(args, store: Store) -> int:
         for task in created:
             task["id"] = store.take_id()
         for task in closed + created + linked:
-            store.write(task)
+            store.write(task, by=owners.get(id(task)))
         meta = store.meta()
         meta["last_sync_ts"] = time.time()
         store.save_meta(meta)
@@ -1354,17 +1578,200 @@ def git_state(project_root: Path) -> dict:
     }
 
 
-def transcript_of(project_root: Path, uuid: str) -> Path | None:
+def find_transcript(uuid: str, places: list[Path] | None = None) -> Path | None:
     if not uuid:
         return None
-    proj = claude_home() / "projects" / project_slug(project_root)
-    exact = proj / f"{uuid}.jsonl"
-    if exact.is_file():
-        return exact
-    if not proj.is_dir():
+    base = claude_home() / "projects"
+    for place in places or []:
+        exact = base / project_slug(place) / f"{uuid}.jsonl"
+        if exact.is_file():
+            return exact
+    if not base.is_dir():
         return None
-    matches = sorted(proj.glob(f"{uuid[:8]}*.jsonl"))
+    matches = sorted(base.glob(f"*/{uuid}.jsonl"))
+    if not matches and len(uuid) < 36:
+        matches = sorted(base.glob(f"*/{uuid}*.jsonl"))
     return matches[0] if matches else None
+
+
+def transcript_cwd(path: Path) -> str | None:
+    try:
+        with path.open(encoding="utf-8") as fh:
+            for index, line in enumerate(fh):
+                if index >= 50:
+                    break
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(data, dict) and data.get("cwd"):
+                    return str(data["cwd"])
+    except (OSError, UnicodeDecodeError):
+        return None
+    return None
+
+
+def pid_alive(pid: int) -> bool:
+    if os.name != "posix":
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def live_registry() -> list[dict] | None:
+    folder = claude_home() / "sessions"
+    if not folder.is_dir():
+        return None
+    entries = []
+    for path in folder.glob("*.json"):
+        try:
+            data = read_json(path)
+            pid = int(data.get("pid") or 0)
+        except (json.JSONDecodeError, OSError, ValueError, TypeError, AttributeError):
+            continue
+        if pid and data.get("sessionId") and pid_alive(pid):
+            entries.append(data)
+    return entries
+
+
+def session_anchor(uuid: str | None = None) -> Path | None:
+    env = os.environ.get("CLAUDE_PROJECT_DIR")
+    if env:
+        return Path(env).resolve()
+    uuid = session_uuid(uuid)
+    if not uuid:
+        return None
+    for entry in live_registry() or []:
+        if entry.get("sessionId") == uuid and entry.get("cwd"):
+            return Path(str(entry["cwd"])).resolve()
+    path = find_transcript(uuid)
+    cwd = transcript_cwd(path) if path else None
+    return Path(cwd).resolve() if cwd else None
+
+
+def cwd_branch(cwd: str | None = None) -> str:
+    try:
+        return head_branch(git_toplevel(Path(cwd or os.getcwd()).resolve()))
+    except OSError:
+        return ""
+
+
+def worktree_branch(cwd: str | None = None) -> str:
+    try:
+        top = git_toplevel(Path(cwd or os.getcwd()).resolve())
+    except OSError:
+        return ""
+    if top is None or main_checkout(top) == top:
+        return ""
+    return head_branch(top)
+
+
+def work_place(store: Store, cwd: str | None = None) -> tuple[Path, str, Path | None]:
+    try:
+        top = git_toplevel(Path(cwd or os.getcwd()).resolve())
+    except OSError:
+        top = None
+    if top is None:
+        return store.root.parent.parent.resolve(), "", None
+    return top, head_branch(top), top
+
+
+def handoff_place(record: dict) -> str:
+    return str(record.get("worktree") or record.get("cwd") or "")
+
+
+def handoff_branch(record: dict) -> str:
+    branch = str((record.get("git") or {}).get("branch") or "")
+    return "" if branch == "HEAD" else branch
+
+
+def project_places(store: Store) -> list[Path]:
+    if store._places is not None:
+        return store._places
+    root = store.root.parent.parent.resolve()
+    places = [root]
+    top = git_toplevel(root)
+    if top is not None:
+        places.extend(p for p in worktree_paths(main_checkout(top)) if p not in places)
+    for record in read_handoffs(store):
+        place = handoff_place(record)
+        if place and Path(place) not in places:
+            places.append(Path(place))
+    store._places = places
+    return places
+
+
+def transcript_dirs(store: Store) -> list[Path]:
+    base = claude_home() / "projects"
+    dirs = []
+    for place in project_places(store):
+        folder = base / project_slug(place)
+        if folder.is_dir() and folder not in dirs:
+            dirs.append(folder)
+    return dirs
+
+
+def owning_place(path: Path, places: list[Path]) -> Path | None:
+    for place in sorted(places, key=lambda p: len(str(p)), reverse=True):
+        if is_within(path, place):
+            return place
+    return None
+
+
+def live_neighbours(store: Store, own: str) -> list[dict]:
+    places = project_places(store)
+    now = time.time()
+    found = []
+    registry = live_registry()
+    if registry is not None:
+        for entry in registry:
+            uuid = str(entry.get("sessionId"))
+            if uuid == own or not entry.get("cwd"):
+                continue
+            place = owning_place(Path(str(entry["cwd"])).resolve(), places)
+            if place is None:
+                continue
+            status = str(entry.get("status") or "")
+            stamp = float(entry.get("updatedAt") or entry.get("startedAt") or 0) / 1000
+            age = 0.0 if status == "busy" else max(0.0, now - stamp)
+            found.append({"key": session_key(uuid), "place": place, "age": age, "status": status})
+        return found
+    cutoff = now - LIVE_MINUTES * 60
+    base = claude_home() / "projects"
+    for place in places:
+        for path in (base / project_slug(place)).glob("*.jsonl"):
+            if path.stem == own:
+                continue
+            with contextlib.suppress(OSError):
+                mtime = path.stat().st_mtime
+                if mtime >= cutoff:
+                    found.append({"key": session_key(path.stem), "place": place, "age": now - mtime, "status": ""})
+    return found
+
+
+def fmt_age(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return "сейчас"
+    if minutes < 60:
+        return f"{minutes} мин назад"
+    return f"{minutes // 60} ч назад"
+
+
+def live_marks(store: Store) -> dict[str, str]:
+    own = session_uuid()
+    try:
+        neighbours = live_neighbours(store, own)
+    except OSError:
+        return {}
+    return {n["key"]: f"сессия {n['key']} ({fmt_age(n['age'])})" for n in neighbours if n["key"] != session_key(own)}
 
 
 def transcript_started_at(path: Path) -> float | None:
@@ -1388,7 +1795,7 @@ def transcript_started_at(path: Path) -> float | None:
 
 
 def session_window(store: Store, uuid: str) -> tuple[float | None, float | None]:
-    path = transcript_of(store.root.parent.parent, uuid)
+    path = find_transcript(uuid, project_places(store))
     if path is None:
         return None, None
     try:
@@ -1401,7 +1808,10 @@ def session_tasks(store: Store, uuid: str) -> tuple[list[dict], list[dict], list
     key = session_key(uuid)
     if key == "unknown" or not store.tasks_dir.is_dir():
         return [], [], []
-    mine = [t for t in store.all() if key in (t.get("session"), t.get("created_by"), t.get("closed_by"))]
+    mine = [
+        t for t in store.all()
+        if key in (t.get("session"), t.get("created_by"), t.get("closed_by")) or key in (t.get("touched_by") or [])
+    ]
     closed = [t for t in mine if t.get("status") in TERMINAL and t.get("closed_by") == key]
     done_ids = {t["id"] for t in closed}
     created = [t for t in mine if t.get("created_by") == key and t["id"] not in done_ids]
@@ -1438,27 +1848,94 @@ def read_handoffs(store: Store) -> list[dict]:
     return sorted(records, key=lambda r: float(r.get("ts") or 0), reverse=True)
 
 
-def pick_handoff(records: list[dict], wanted: str | None) -> dict | None:
-    if not records:
-        return None
-    if not wanted or wanted == "latest":
-        return records[0]
-    key = session_key(session_uuid(wanted))
-    for record in records:
-        if record.get("key") == key or str(record.get("session") or "").startswith(key):
-            return record
+def own_handoff(records: list[dict], place: Path, branch: str) -> dict | None:
+    here = str(place)
+    tests = (
+        lambda r: handoff_place(r) == here and handoff_branch(r) == branch,
+        lambda r: bool(branch) and handoff_branch(r) == branch,
+        lambda r: handoff_place(r) == here,
+    )
+    for test in tests:
+        for record in records:
+            if test(record):
+                return record
     return None
+
+
+def handoff_where(record: dict, place: Path | None, branch: str) -> str:
+    if place is None:
+        return ""
+    parts = []
+    record_place = handoff_place(record)
+    if record_place and record_place != str(place):
+        parts.append(f"ворктри {Path(record_place).name}")
+    record_branch = handoff_branch(record)
+    if record_branch and record_branch != branch:
+        parts.append(f"ветка {record_branch}")
+    return ", ".join(parts)
+
+
+def handoff_tasks(record: dict) -> set[int]:
+    tasks = record.get("tasks") or {}
+    return {int(i) for field in ("closed", "created", "touched") for i in tasks.get(field) or []}
+
+
+def handoff_matches(record: dict, query: str) -> bool:
+    needle = query.strip().lower()
+    stamps = [handoff_stamp(record)]
+    if record.get("created_ts"):
+        stamps.append(time.strftime("%Y-%m-%d %H:%M", time.localtime(float(record["created_ts"]))))
+    place = handoff_place(record)
+    fields = [
+        str(record.get("key") or ""),
+        str(record.get("session") or ""),
+        handoff_branch(record),
+        Path(place).name if place else "",
+        handoff_title(record),
+        Path(str(record.get("_path") or "")).name,
+        *stamps,
+    ]
+    return any(needle in field.lower() for field in fields if field)
+
+
+def select_handoffs(records: list[dict], query: str | None, task: int | None = None) -> list[dict]:
+    found = [r for r in records if task is None or task in handoff_tasks(r)]
+    if not query or query == "latest":
+        return found
+    key = session_key(session_uuid(query))
+    exact = [r for r in found if r.get("key") == key or str(r.get("session") or "") == query]
+    return exact or [r for r in found if handoff_matches(r, query)]
+
+
+def pick_handoff(
+    records: list[dict], wanted: str | None, place: Path | None = None, branch: str = "", task: int | None = None
+) -> list[dict]:
+    found = select_handoffs(records, wanted, task)
+    if found and (not wanted or wanted == "latest") and place is not None:
+        own = own_handoff(found, place, branch)
+        if own is not None:
+            found = [own] + [r for r in found if r is not own]
+    return found
 
 
 def prune_handoffs(store: Store, keep: int, days: int = 0) -> int:
     records = read_handoffs(store)
-    doomed = list(records[keep:]) if keep > 0 else []
+    protected: set[str] = set()
+    per_place: dict[tuple[str, str], int] = {}
+    for record in records:
+        group = (handoff_place(record), handoff_branch(record))
+        if per_place.get(group, 0) < HANDOFF_KEEP_PER_PLACE:
+            per_place[group] = per_place.get(group, 0) + 1
+            protected.add(record["_path"])
+    doomed = [r for r in records[keep:] if r["_path"] not in protected] if keep > 0 else []
     if days > 0:
         cutoff = time.time() - days * 86400
-        doomed.extend(r for r in records[:keep] if float(r.get("ts") or 0) < cutoff)
+        gone = {r["_path"] for r in doomed}
+        doomed.extend(r for r in records if r["_path"] not in gone and float(r.get("ts") or 0) < cutoff)
     for record in doomed:
         with contextlib.suppress(OSError):
             Path(record["_path"]).unlink()
+        shutil.rmtree(attachments_dir(Path(record["_path"])), ignore_errors=True)
     return len(doomed)
 
 
@@ -1501,21 +1978,23 @@ def task_lines(store: Store, ids: list[int]) -> list[str]:
     return lines
 
 
-def handoff_head(record: dict, current: str) -> str:
+def handoff_head(record: dict, current: str, where: str = "") -> str:
     git = record.get("git") or {}
-    where = git.get("branch") or ""
-    if where and git.get("head"):
-        where += f"@{git['head']}"
-    if where and git.get("dirty"):
-        where += f", не закоммичено файлов: {git['dirty']}"
+    ref = git.get("branch") or ""
+    if ref and git.get("head"):
+        ref += f"@{git['head']}"
+    if ref and git.get("dirty"):
+        ref += f", не закоммичено файлов: {git['dirty']}"
     marks = []
     if record.get("key") == current:
         marks.append("эта сессия")
     if record.get("kind") == "auto":
         marks.append("авто, без финализации")
-    head = f"Handoff {record.get('key')} · {handoff_stamp(record)}"
     if where:
-        head += f" · {where}"
+        marks.append(f"другое место — {where}")
+    head = f"Handoff {record.get('key')} · {handoff_stamp(record)}"
+    if ref:
+        head += f" · {ref}"
     if marks:
         head += " · " + ", ".join(marks)
     return head
@@ -1533,11 +2012,14 @@ def strip_h1(text: str, title: str) -> str:
     return (text or "").strip()
 
 
-def render_handoff(record: dict, store: Store, current: str) -> str:
-    out = [f"# {handoff_head(record, current)}", ""]
+def render_handoff(record: dict, store: Store, current: str, where: str = "") -> str:
+    out = [f"# {handoff_head(record, current, where)}", ""]
     title = record.get("title")
     if title:
         out.extend([f"**{title}**", ""])
+    place = handoff_place(record)
+    if place and Path(place) != store.root.parent.parent.resolve():
+        out.extend([f"ворктри: {place}", ""])
     tasks = record.get("tasks") or {}
     for field, label in (("closed", "Закрыто"), ("created", "Заведено"), ("touched", "Тронуто")):
         ids = [int(i) for i in tasks.get(field) or []]
@@ -1546,16 +2028,135 @@ def render_handoff(record: dict, store: Store, current: str) -> str:
         out.append(f"## {label}")
         out.extend(f"- {line}" for line in task_lines(store, ids))
         out.append("")
+    attachments = record.get("attachments") or []
+    if attachments:
+        out.append("## Вложения")
+        if record.get("_path"):
+            out.append(f"каталог: {attachments_dir(Path(record['_path']))}")
+        out.extend(f"- {a.get('name')} ({fmt_size(int(a.get('bytes') or 0))})" for a in attachments)
+        out.append("")
     body = strip_h1(record.get("body") or "", record.get("title") or "")
     if body:
         out.extend([body, ""])
     return "\n".join(out).rstrip() + "\n"
 
 
-def write_handoff(store: Store, record: dict, keep: int) -> int:
+def slug_part(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9.-]+", "-", text).strip("-.")[:40].strip("-.")
+
+
+def handoff_filename(record: dict) -> str:
+    stamp = time.strftime("%Y-%m-%d_%H%M", time.localtime(float(record.get("created_ts") or record.get("ts") or 0)))
+    branch = slug_part(handoff_branch(record))
+    return "_".join([stamp, *([branch] if branch else []), str(record["key"])]) + ".json"
+
+
+def handoff_files(store: Store, key: str) -> list[Path]:
+    if not store.handoff_dir.is_dir():
+        return []
+    return sorted(
+        p for p in store.handoff_dir.glob(f"*{key}.json")
+        if p.name == f"{key}.json" or p.name.endswith(f"_{key}.json")
+    )
+
+
+def attachments_dir(path: Path) -> Path:
+    return path.with_suffix("")
+
+
+def handoff_target(store: Store, record: dict) -> Path:
+    existing = handoff_files(store, record["key"])
+    if not record.get("created_ts"):
+        first = None
+        for old in existing:
+            with contextlib.suppress(json.JSONDecodeError, OSError):
+                data = read_json(old)
+                first = data.get("created_ts") or data.get("ts")
+                break
+        record["created_ts"] = first or record.get("ts")
+    current = next((p for p in existing if p.name != f"{record['key']}.json"), None)
+    return current or store.handoff_dir / handoff_filename(record)
+
+
+def store_handoff(store: Store, record: dict) -> Path:
     store.handoff_dir.mkdir(parents=True, exist_ok=True)
-    write_json(store.handoff_dir / f"{record['key']}.json", record)
-    return prune_handoffs(store, keep)
+    data = {k: v for k, v in record.items() if k != "_path"}
+    path = handoff_target(store, data)
+    write_json(path, data)
+    for old in handoff_files(store, data["key"]):
+        if old == path:
+            continue
+        folder = attachments_dir(old)
+        if folder.is_dir() and not attachments_dir(path).exists():
+            folder.rename(attachments_dir(path))
+        old.unlink(missing_ok=True)
+    return path
+
+
+def legacy_handoffs(store: Store) -> list[dict]:
+    return [r for r in read_handoffs(store) if Path(r["_path"]).name == f"{r.get('key')}.json"]
+
+
+def rename_legacy_handoffs(store: Store) -> int:
+    renamed = 0
+    for record in legacy_handoffs(store):
+        with contextlib.suppress(OSError):
+            store_handoff(store, record)
+            renamed += 1
+    return renamed
+
+
+def write_handoff(store: Store, record: dict, keep: int) -> int:
+    with locked(store):
+        rename_legacy_handoffs(store)
+        store_handoff(store, record)
+        return prune_handoffs(store, keep)
+
+
+def path_bytes(path: Path) -> int:
+    if path.is_file():
+        return path.stat().st_size
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+
+
+def fmt_size(size: int) -> str:
+    if size < 1024:
+        return f"{size} Б"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.0f} КБ"
+    return f"{size / 1024 / 1024:.1f} МБ"
+
+
+def attachment_list(folder: Path) -> list[dict]:
+    if not folder.is_dir():
+        return []
+    return [
+        {"name": entry.name + ("/" if entry.is_dir() else ""), "bytes": path_bytes(entry)}
+        for entry in sorted(folder.iterdir())
+    ]
+
+
+def check_attachments(sources: list[str], folder: Path) -> list[Path]:
+    paths = [Path(s).expanduser().resolve() for s in sources]
+    missing = [str(p) for p in paths if not p.exists()]
+    if missing:
+        raise CctmError("вложение не найдено: " + ", ".join(missing))
+    nested = [str(p) for p in paths if is_within(folder, p)]
+    if nested:
+        raise CctmError("вложение содержит сам стор: " + ", ".join(nested))
+    total = sum(path_bytes(p) for p in paths) + (path_bytes(folder) if folder.is_dir() else 0)
+    if total > HANDOFF_ATTACH_MAX_MB * 1024 * 1024:
+        raise CctmError(f"вложения {fmt_size(total)}, максимум {HANDOFF_ATTACH_MAX_MB} МБ: приложи скрипты и выжимку, не дампы")
+    return paths
+
+
+def copy_attachments(paths: list[Path], folder: Path) -> None:
+    folder.mkdir(parents=True, exist_ok=True)
+    for path in paths:
+        if path.is_dir():
+            shutil.copytree(path, folder / path.name, dirs_exist_ok=True)
+        else:
+            shutil.copy2(path, folder / path.name)
 
 
 def cmd_handoff_write(args, store: Store) -> int:
@@ -1574,7 +2175,7 @@ def cmd_handoff_write(args, store: Store) -> int:
         parse_ids(args.touched) or [t["id"] for t in auto_touched],
     )
     closed, created, touched = groups["closed"], groups["created"], groups["touched"]
-    project_root = store.root.parent.parent
+    place, _, top = work_place(store)
     record = {
         "version": HANDOFF_VERSION,
         "key": session_key(uuid),
@@ -1583,31 +2184,51 @@ def cmd_handoff_write(args, store: Store) -> int:
         "ts": time.time(),
         "date": today(),
         "title": (args.title or h1_of(text)).strip()[:120],
-        "cwd": str(project_root),
-        "git": git_state(project_root),
+        "cwd": os.getcwd(),
+        "worktree": str(place),
+        "git": git_state(top) if top else {},
         "tasks": {"closed": closed, "created": created, "touched": touched},
         "body": text,
     }
+    folder = attachments_dir(handoff_target(store, record))
+    if args.attach:
+        copy_attachments(check_attachments(args.attach, folder), folder)
+    if folder.is_dir():
+        record["attachments"] = attachment_list(folder)
     dropped = write_handoff(store, record, args.keep)
     if not args.quiet:
         print(f"handoff {record['key']} записан · закрыто {len(closed)}, заведено {len(created)}, тронуто {len(touched)}")
+        if record.get("attachments"):
+            print(f"вложения: {folder}")
         if dropped:
             print(f"вытеснено старых handoff: {dropped}")
     return 0
+
+
+def auto_title(tasks: list[dict]) -> str:
+    parts = []
+    for task in tasks[:3]:
+        title = str(task.get("title") or "")
+        parts.append(f"#{task['id']} " + (title if len(title) <= 40 else title[:39] + "…"))
+    more = f" и ещё {len(tasks) - 3}" if len(tasks) > 3 else ""
+    return ("без финализации: " + "; ".join(parts) + more)[:120]
 
 
 def cmd_handoff_auto(args, store: Store) -> int:
     uuid = session_uuid(args.session)
     if not uuid or not store.exists():
         return 0
+    cwd = getattr(args, "cwd", None) or os.getcwd()
+    place, _, top = work_place(store, cwd)
     closed, created, rest = session_tasks(store, uuid)
     touched = closed + created + rest
     if not touched:
         return 0
     key = session_key(uuid)
-    path = store.handoff_dir / f"{key}.json"
+    files = handoff_files(store, key)
+    path = next((f for f in files if f.name != f"{key}.json"), files[0] if files else None)
     previous = None
-    if path.is_file():
+    if path is not None:
         with contextlib.suppress(json.JSONDecodeError, OSError):
             existing = read_json(path)
             newest = max((store.path_of(t["id"]).stat().st_mtime for t in touched), default=0)
@@ -1637,7 +2258,8 @@ def cmd_handoff_auto(args, store: Store) -> int:
         record.update({
             "ts": time.time(),
             "date": today(),
-            "git": git_state(store.root.parent.parent),
+            "worktree": str(place),
+            "git": git_state(top) if top else {},
             "tasks": merged,
             "body": (previous.get("body") or "").strip() + "\n\n" + "\n".join(lines),
         })
@@ -1650,7 +2272,6 @@ def cmd_handoff_auto(args, store: Store) -> int:
         "Сессия закончилась без /finalize — handoff собран автоматически по изменениям реестра.",
         "Списки выше полные, текста от модели нет: тела задач могут быть неполными, сверься с `cctm show N`.",
     ]
-    project_root = store.root.parent.parent
     record = {
         "version": HANDOFF_VERSION,
         "key": key,
@@ -1658,9 +2279,10 @@ def cmd_handoff_auto(args, store: Store) -> int:
         "kind": "auto",
         "ts": time.time(),
         "date": today(),
-        "title": f"без финализации: закрыто {len(closed)}, заведено {len(created)}, в работе {len(rest)}",
-        "cwd": str(project_root),
-        "git": git_state(project_root),
+        "title": auto_title(touched),
+        "cwd": cwd,
+        "worktree": str(place),
+        "git": git_state(top) if top else {},
         "tasks": split_task_groups([t["id"] for t in closed], [t["id"] for t in created], [t["id"] for t in rest]),
         "body": "\n".join(lines).strip(),
     }
@@ -1670,47 +2292,76 @@ def cmd_handoff_auto(args, store: Store) -> int:
     return 0
 
 
+def handoff_group_label(group: tuple[str, str], here: tuple[str, str]) -> str:
+    place, branch = group
+    parts = ["здесь"] if group == here else []
+    if branch:
+        parts.append(f"ветка {branch}")
+    if place:
+        parts.append(place)
+    return " · ".join(parts) + ":"
+
+
 def cmd_handoff_list(args, store: Store) -> int:
-    records = read_handoffs(store)
+    records = select_handoffs(read_handoffs(store), args.query, args.task)[: args.limit]
     if args.json:
-        json.dump([{k: v for k, v in r.items() if k != "_path"} for r in records[: args.limit]], sys.stdout, ensure_ascii=False, indent=2)
+        json.dump([{k: v for k, v in r.items() if k != "_path"} for r in records], sys.stdout, ensure_ascii=False, indent=2)
         print()
         return 0
     if not records:
-        print("handoff нет")
+        print("handoff нет" if not (args.query or args.task) else "совпадений нет")
         return 0
     current = session_key(session_uuid())
-    for record in records[: args.limit]:
-        tasks = record.get("tasks") or {}
-        counts = f"закрыто {len(tasks.get('closed') or [])} · тронуто {len(tasks.get('touched') or [])}"
-        marks = []
-        if record.get("key") == current:
-            marks.append("эта сессия")
-        if record.get("kind") == "auto":
-            marks.append("авто")
-        if wrote_after_handoff(store, record):
-            marks.append("сессия писала после handoff")
-        row = f"{handoff_stamp(record)}  {str(record.get('key')):<10} {counts:<30} {handoff_title(record)[:50]}"
-        if marks:
-            row += "  [" + ", ".join(marks) + "]"
-        print(row)
+    place, branch, _ = work_place(store)
+    here = (str(place), branch)
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for record in records:
+        groups.setdefault((handoff_place(record), handoff_branch(record)), []).append(record)
+    order = sorted(groups, key=lambda g: (g != here, -float(groups[g][0].get("ts") or 0)))
+    headed = len(groups) > 1 or order[0] != here
+    for index, group in enumerate(order):
+        if headed:
+            if index:
+                print()
+            print(handoff_group_label(group, here))
+        for record in groups[group]:
+            tasks = record.get("tasks") or {}
+            counts = f"закрыто {len(tasks.get('closed') or [])} · тронуто {len(tasks.get('touched') or [])}"
+            marks = []
+            if record.get("key") == current:
+                marks.append("эта сессия")
+            if record.get("kind") == "auto":
+                marks.append("авто")
+            if record.get("attachments"):
+                marks.append(f"вложений {len(record['attachments'])}")
+            if wrote_after_handoff(store, record):
+                marks.append("сессия писала после handoff")
+            row = f"{'  ' if headed else ''}{handoff_stamp(record)}  {str(record.get('key')):<10} {counts:<30} {handoff_title(record)[:50]}"
+            if marks:
+                row += "  [" + ", ".join(marks) + "]"
+            print(row)
     return 0
 
 
 def cmd_handoff_show(args, store: Store) -> int:
     records = read_handoffs(store)
     wanted = getattr(args, "session", None)
-    record = pick_handoff(records, wanted)
-    if record is None:
+    place, branch, _ = work_place(store)
+    found = pick_handoff(records, wanted, place, branch, args.task)
+    if not found:
         if not records:
             print("handoff нет")
             return 0
-        print(f"handoff не найден: {wanted}")
+        print(f"handoff не найден: {wanted or ''}{f' с задачей #{args.task}' if args.task else ''}".strip())
         return 1
+    record = found[0]
     if args.json:
-        text = json.dumps({k: v for k, v in record.items() if k != "_path"}, ensure_ascii=False, indent=2) + "\n"
+        data = {k: v for k, v in record.items() if k != "_path"}
+        if record.get("attachments"):
+            data["attachments_dir"] = str(attachments_dir(Path(record["_path"])))
+        text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
     else:
-        text = render_handoff(record, store, session_key(session_uuid()))
+        text = render_handoff(record, store, session_key(session_uuid()), handoff_where(record, place, branch))
     if args.out:
         path = Path(args.out).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1720,13 +2371,17 @@ def cmd_handoff_show(args, store: Store) -> int:
     sys.stdout.write(text)
     if args.json:
         return 0
+    if wanted and wanted != "latest" and len(found) > 1:
+        print(f"\nсовпало ещё {len(found) - 1}: cctm handoff list {shlex.quote(wanted)}")
     cutoff = time.time() - args.hours * 3600
     others = [r for r in records if r is not record and float(r.get("ts") or 0) >= cutoff]
     if others:
         print()
         print(f"параллельно писали ещё сессий: {len(others)} (за {args.hours}ч)")
         for other in others[:5]:
-            mark = " · сессия писала после handoff" if wrote_after_handoff(store, other) else ""
+            where = handoff_where(other, place, branch)
+            mark = f" · {where}" if where else ""
+            mark += " · сессия писала после handoff" if wrote_after_handoff(store, other) else ""
             print(f"  {handoff_stamp(other)} {other.get('key')} — {handoff_title(other)[:60]}{mark}")
         print(f"  подробности: cctm handoff show <key>")
     return 0
@@ -1739,7 +2394,10 @@ def cmd_handoff_prune(args, store: Store) -> int:
 
 
 def cmd_session_end(args, store: Store) -> int:
+    global SESSION_OVERRIDE
     payload = hook_payload() if args.from_hook else {}
+    uuid = session_uuid(payload.get("session_id") or args.session)
+    SESSION_OVERRIDE = uuid
     if args.from_hook:
         root = hook_root(payload.get("cwd"))
         if root is None:
@@ -1747,15 +2405,12 @@ def cmd_session_end(args, store: Store) -> int:
         store = Store(root)
     if not store.exists():
         return 0
-    uuid = session_uuid(payload.get("session_id") or args.session)
-    global SESSION_OVERRIDE
-    SESSION_OVERRIDE = uuid
     with contextlib.suppress(Exception):
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
             cmd_sync(argparse.Namespace(quiet=True, from_hook=False, dry_run=False, session=None, all=False), store)
     with contextlib.suppress(Exception):
-        cmd_handoff_auto(argparse.Namespace(session=uuid, quiet=True, keep=args.keep), store)
+        cmd_handoff_auto(argparse.Namespace(session=uuid, quiet=True, keep=args.keep, cwd=payload.get("cwd")), store)
     return 0
 
 
@@ -1826,9 +2481,12 @@ def session_start_mode(store: Store) -> str:
     return value if value in SESSION_START_MODES else "brief"
 
 
-def session_start_text(store: Store, mode: str) -> str:
-    current = session_key(session_uuid())
-    record = pick_handoff(read_handoffs(store), None)
+def session_start_text(store: Store, mode: str, cwd: str | None = None) -> str:
+    own = session_uuid()
+    current = session_key(own)
+    place, branch, _ = work_place(store, cwd)
+    records = read_handoffs(store)
+    record = own_handoff(records, place, branch)
     out: list[str] = []
     if record is not None and mode == "full":
         out.append(render_handoff(record, store, current).rstrip())
@@ -1845,13 +2503,38 @@ def session_start_text(store: Store, mode: str) -> str:
         ]
         if counts:
             out.append("задачи: " + " · ".join(counts))
+        if record.get("attachments"):
+            out.append(f"вложений: {len(record['attachments'])} — cctm handoff show {record.get('key')}")
         step = md_section(record.get("body") or "", ("следующий шаг", "next step"))
         if step:
             out.extend(["", "### Следующий шаг", clamp_text(step, SESSION_START_STEP_LINES, SESSION_START_STEP_CHARS)])
-    ready, blocked, by_id = split_next(store)
+    cutoff = time.time() - HANDOFF_FRESH_HOURS * 3600
+    others = [
+        r for r in records
+        if r is not record and r.get("key") != current and float(r.get("ts") or 0) >= cutoff
+    ][:SESSION_START_OTHERS]
+    if others:
+        out.extend(["", "### Другие свежие handoff"] if out else ["### Другие свежие handoff"])
+        for other in others:
+            where = handoff_where(other, place, branch) or "здесь же"
+            out.append(f"- {handoff_stamp(other)} {other.get('key')} · {where} — {handoff_title(other)[:60]}")
+        out.append("показать: cctm handoff show <key>")
+    try:
+        neighbours = live_neighbours(store, own)
+    except OSError:
+        neighbours = []
+    if neighbours:
+        out.extend(["", "### Параллельные сессии"] if out else ["### Параллельные сессии"])
+        for n in neighbours:
+            if n["place"] == place:
+                out.append(f"⚠ В этом дереве работает сессия {n['key']} ({fmt_age(n['age'])}): её правки в git status не твои — не откатывай.")
+            else:
+                out.append(f"- {n['key']} в {n['place'].name} ({fmt_age(n['age'])})")
+    live = {n["key"]: f"сессия {n['key']} ({fmt_age(n['age'])})" for n in neighbours}
+    ready, blocked, by_id = split_next(store, worktree_branch(cwd))
     if ready:
         out.extend(["", "### Очередь"] if out else [])
-        out.extend(format_row(task, by_id) for task in ready[:SESSION_START_NEXT])
+        out.extend(format_row(task, by_id, live) for task in ready[:SESSION_START_NEXT])
         rest = []
         if len(ready) > SESSION_START_NEXT:
             rest.append(f"ещё открытых: {len(ready) - SESSION_START_NEXT}")
@@ -1862,7 +2545,7 @@ def session_start_text(store: Store, mode: str) -> str:
     warn = version_warning()
     if not out and not warn:
         return ""
-    head = "Контекст прошлой сессии" if record is not None else "Очередь задач"
+    head = "Контекст прошлой сессии" if record is not None else "Контекст проекта" if others or neighbours else "Очередь задач"
     lines = [f"## {head} (cc-task-manager)", ""]
     if warn:
         lines.extend(warn + [""])
@@ -1872,7 +2555,9 @@ def session_start_text(store: Store, mode: str) -> str:
 
 
 def cmd_session_start(args, store: Store) -> int:
+    global SESSION_OVERRIDE
     payload = hook_payload() if args.from_hook else {}
+    SESSION_OVERRIDE = session_uuid(payload.get("session_id") or args.session)
     if args.from_hook:
         root = hook_root(payload.get("cwd"))
         if root is None:
@@ -1883,13 +2568,11 @@ def cmd_session_start(args, store: Store) -> int:
     source = str(payload.get("source") or args.source or "startup").strip().lower()
     if source not in SESSION_START_SOURCES:
         return 0
-    global SESSION_OVERRIDE
-    SESSION_OVERRIDE = session_uuid(payload.get("session_id") or args.session)
     mode = args.mode or session_start_mode(store)
     if mode == "off":
         return 0
     try:
-        text = session_start_text(store, mode)
+        text = session_start_text(store, mode, payload.get("cwd"))
     except Exception as exc:
         if not args.quiet:
             print(f"cctm session-start: {exc}", file=sys.stderr)
@@ -1992,6 +2675,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fix", action="store_true")
     p.set_defaults(func=cmd_doctor)
 
+    p = sub.add_parser("merge", help="влить чужой стор (например, форк из ворктри) в этот")
+    p.add_argument("source", help="путь к .claude/session источника или к каталогу проекта")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--keep-source", action="store_true", help="не переименовывать источник")
+    p.set_defaults(func=cmd_merge)
+
     p = sub.add_parser("sync", help="синхронизация с нативным стором Claude Code")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--session", help="uuid или session-XXXXXXXX конкретной сессии")
@@ -2010,6 +2699,7 @@ def build_parser() -> argparse.ArgumentParser:
     h.add_argument("--created", help="id заведённых задач")
     h.add_argument("--touched", help="id задач, которых касались")
     h.add_argument("--session", help="uuid сессии (по умолчанию CLAUDE_CODE_SESSION_ID)")
+    h.add_argument("--attach", action="append", help="файл или каталог в handoff (можно несколько раз)")
     h.add_argument("--keep", type=int, default=HANDOFF_KEEP)
     h.add_argument("--quiet", action="store_true")
     h.set_defaults(func=cmd_handoff_write)
@@ -2020,19 +2710,23 @@ def build_parser() -> argparse.ArgumentParser:
     h.add_argument("--quiet", action="store_true")
     h.set_defaults(func=cmd_handoff_auto)
 
-    h = hsub.add_parser("list", help="handoff всех сессий, свежие сверху")
+    h = hsub.add_parser("list", help="handoff всех сессий по веткам, свежие сверху")
+    h.add_argument("query", nargs="?", help="фильтр: key, ветка, ворктри, дата, слово из заголовка")
+    h.add_argument("--task", type=int, help="только handoff, где есть задача N")
     h.add_argument("--limit", type=int, default=10)
     h.add_argument("--json", action="store_true")
     h.set_defaults(func=cmd_handoff_list)
 
     h = hsub.add_parser("show", help="показать handoff сессии")
-    h.add_argument("session", nargs="?", help="key сессии или latest")
+    h.add_argument("session", nargs="?", help="key, ветка, ворктри, дата, слово из заголовка или latest")
+    h.add_argument("--task", type=int, help="handoff, где есть задача N")
     h.add_argument("--hours", type=int, default=HANDOFF_FRESH_HOURS)
     h.add_argument("--json", action="store_true")
     h.add_argument("--out", help="записать в файл вместо stdout")
     h.set_defaults(func=cmd_handoff_show)
 
-    h = hsub.add_parser("latest", help="самый свежий handoff")
+    h = hsub.add_parser("latest", help="самый свежий handoff этого места")
+    h.add_argument("--task", type=int, help="handoff, где есть задача N")
     h.add_argument("--hours", type=int, default=HANDOFF_FRESH_HOURS)
     h.add_argument("--json", action="store_true")
     h.add_argument("--out", help="записать в файл вместо stdout")
@@ -2089,7 +2783,7 @@ def main(argv: list[str]) -> int:
         store = Store(Path(args.path).resolve() / ".claude" / "session")
     else:
         store = Store(Path(args.root).resolve() if args.root else find_root())
-    if args.command not in ("init", "migrate", "handoff", "session-end", "session-start") and not store.exists():
+    if args.command not in ("init", "migrate", "merge", "handoff", "session-end", "session-start") and not store.exists():
         legacy = store.legacy_count()
         if legacy and (getattr(args, "quiet", False) or getattr(args, "from_hook", False)):
             return 0

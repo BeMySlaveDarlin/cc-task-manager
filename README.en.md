@@ -46,13 +46,15 @@ cctm create --title "..." --priority HIGH
 cctm close 7
 cctm grep "auth"      # search task bodies
 cctm sync             # reconcile with Claude Code native tasks
-cctm doctor           # invariant check
+cctm doctor           # invariant check, including store forks in worktrees
+cctm merge ../wt      # merge another store (a worktree fork) into this one
 cctm export --md      # human-readable dump
 
-cctm handoff latest   # snapshot of the last session
-cctm handoff list     # who finalized and when, parallel sessions included
-cctm handoff show ab12cd34
-cctm handoff write --md handoff.md
+cctm handoff latest   # snapshot of the last session in this worktree and branch
+cctm handoff list     # who finalized and when, grouped by worktree and branch
+cctm handoff show feat          # by key, branch, worktree, date or a word from the title
+cctm handoff show --task 12     # the handoff that includes task 12
+cctm handoff write --md handoff.md --attach probe.py --attach results/
 ```
 
 ## Storage
@@ -62,7 +64,8 @@ cctm handoff write --md handoff.md
 ```
 meta.json               id counter, schema version
 tasks/007.json          one task = one file, complete
-handoff/ab12cd34.json   session snapshot: one file per session
+handoff/2026-09-28_1249_feat_ab12cd34.json   session snapshot: first write time, branch, key
+handoff/2026-09-28_1249_feat_ab12cd34/       attachments of that handoff, if any
 ```
 
 Statuses: `open`, `deferred`, `done`, `cancelled`. No markdown files in the store,
@@ -84,9 +87,31 @@ the registry stale.
 | `TaskCompleted` | `cctm sync` | carries the task status into the registry |
 | `SessionEnd` | `cctm session-end` | sync + handoff for an interrupted session |
 
-Hooks stay inside their own project: the store is taken from the current directory or from the
-git repository root, never higher. In a directory without a store the hook exits quietly instead
-of picking up someone else's registry one level up.
+Hooks stay inside their own project (store lookup is described below). In a directory without
+a store the hook exits quietly instead of picking up someone else's registry one level up.
+
+## Worktrees, parallel sessions, projects without git
+
+**Where the store is.** The nearest `.claude/session` from the current directory up to the git
+repository root. If none is found and the directory is a git worktree, the main checkout's store
+is used: all worktrees share one registry, and `cctm init` from a worktree creates it there rather
+than a fork that dies with `git worktree remove`. Without git the boundary is the directory the
+session started in (taken from Claude Code's live session registry or from the transcript): the
+lookup never goes above it, so a non-git project in `~/proj` does not end up in `~/.claude/session`.
+
+**Branch.** A task remembers the branch it was created on; inside a worktree `cctm next` and
+`cctm list` show that branch's tasks first. A handoff remembers its worktree and branch:
+`SessionStart` picks the handoff of its own worktree and branch, lists the others one line each
+("ворктри repo-wt, ветка feat") and never passes them off as "the previous session".
+
+**Neighbours.** A live session in the same tree (same branch, same directory) is reported to a new
+one: "session X is working in this tree — its changes in git status are not yours". A task last
+touched by a live neighbour is marked ⚑ in `next`/`list`. This is not a lock: nothing is stored or
+blocked, and the mark disappears once the session ends.
+
+**Forks.** If a worktree already has its own store (from older versions), `cctm doctor` in the
+main checkout reports it, and `cctm merge <worktree> [--dry-run]` moves its tasks and handoffs
+under new ids, tags likely duplicates with `dup` and renames the source to `session-merged-*`.
 
 ## Context at session start
 
@@ -119,12 +144,28 @@ cctm session-start --raw
 
 Tasks say "what", the handoff says "where we stopped". Written by `/finalize`, read by `/rs`.
 
-One file per session (`handoff/<first 8 chars of the session id>.json`), so parallel sessions
-never overwrite each other: `cctm handoff latest` returns the freshest one and states on a separate
-line how many other sessions wrote in parallel — `cctm handoff list` shows them all.
+One file per session, so parallel sessions never overwrite each other. The name is readable
+without opening the file: `2026-09-28_1249_feat_ab12cd34.json` — date and time of the first write,
+branch (absent without git), first 8 chars of the session id. Rewriting the same handoff keeps the
+name. Old `<key>.json` names are renamed on the next handoff write or by `cctm doctor --fix`.
+
+Finding the right handoff needs no file reading: `cctm handoff show <query>` takes the freshest
+match by key, branch, worktree name, date (`2026-09-27`) or a word from the title; `--task 12`
+finds the handoff that includes task 12. `cctm handoff list [query]` groups by worktree and branch,
+your own group first.
+
+Attachments are for what the next session needs but lives outside git or in a worktree about to be
+removed: `cctm handoff write --md h.md --attach probe.py --attach results/` copies them into a
+directory next to the handoff (up to 20 MB per handoff). `show` lists them with the path, prune
+removes them together with the handoff.
+
+Parallel sessions stay independent: `cctm handoff latest` returns the freshest one for your worktree and
+branch and states on a separate line how many other sessions wrote in parallel — `cctm handoff list`
+shows them all.
 
 Task lists are filled in automatically: every edit stamps the task with the session id
-(`session`, `created_by` in the task JSON), so another session's work never lands in your handoff.
+(`session`, `touched_by`, `created_by` in the task JSON), so another session's work never lands in
+your handoff, and a task touched by two sessions shows up in both handoffs.
 
 The `SessionEnd` hook keeps the handoff honest:
 
@@ -132,7 +173,8 @@ The `SessionEnd` hook keeps the handoff honest:
 - work continued after `/finalize` → an "После финализации" block is appended, the hand-written
   summary is never overwritten.
 
-The last 20 are kept; `cctm handoff prune --keep N --days D` for manual cleanup.
+The last 20 are kept, but the 3 freshest per worktree and branch are never evicted — a busy
+worktree cannot push the others out. `cctm handoff prune --keep N --days D` for manual cleanup.
 
 ## Migrating from 1.x
 
