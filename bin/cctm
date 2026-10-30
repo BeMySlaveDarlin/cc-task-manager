@@ -311,10 +311,11 @@ def locked(store: Store):
             fcntl.flock(fh, fcntl.LOCK_UN)
 
 
-def parse_md(text: str) -> dict:
+def parse_md(text: str, lead: bool = True) -> dict:
     body = empty_body()
     current = None
     buf: list[str] = []
+    head: list[str] = []
 
     def flush():
         if current is None:
@@ -335,10 +336,15 @@ def parse_md(text: str) -> dict:
             current = heading.group(1)
             buf = []
             continue
-        if re.match(r"^#\s+", line) and current is None:
+        if current is None:
+            if not re.match(r"^#\s+", line):
+                head.append(line)
             continue
         buf.append(line)
     flush()
+    preamble = "\n".join(head).strip()
+    if lead and preamble:
+        body["description"] = "\n\n".join(filter(None, (preamble, body["description"])))
     return body
 
 
@@ -1390,7 +1396,7 @@ def cmd_migrate(args, store: Store) -> int:
         blocked_notes = [str(b) for b in blocked_raw if not isinstance(b, int) and b is not None]
         if row.get("blocker_note") and not any(row["blocker_note"] in n or n in row["blocker_note"] for n in blocked_notes):
             blocked_notes.append(row["blocker_note"])
-        body = parse_md(rest)
+        body = parse_md(rest, lead=False)
         if blocked_notes:
             body["notes"]["Блокер (из 1.x)"] = "; ".join(blocked_notes)
         created = str(front.get("created") or plain.get("created") or entry["date_hint"] or today())
@@ -2460,17 +2466,13 @@ def plugin_version(cctm: Path | None = None) -> str:
 def version_warning() -> list[str]:
     mine = self_path()
     found = shutil.which("cctm")
-    if found and Path(found).resolve() == mine:
+    if not found or Path(found).resolve() == mine:
         return []
     actual = plugin_version() or "?"
-    if not found:
-        head = f"cctm нет в PATH (актуальная версия {actual})."
-    else:
-        stale = plugin_version(Path(found).resolve()) or "?"
-        if stale == actual:
-            return []
-        head = f"cctm в PATH — версия {stale}, актуальная {actual}."
-    return [f"⚠ {head}", f"Зови по пути: {mine}"]
+    stale = plugin_version(Path(found).resolve()) or "?"
+    if stale == actual:
+        return []
+    return [f"⚠ cctm в PATH — версия {stale}, актуальная {actual}.", f"Зови по пути: {mine}"]
 
 
 def session_start_mode(store: Store) -> str:
